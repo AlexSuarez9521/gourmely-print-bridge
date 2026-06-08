@@ -15,7 +15,7 @@
 //! upgrade. Prevents random tabs in the cashier's Chrome from talking
 //! to the printer.
 
-use std::{net::SocketAddr, path::Path, time::Instant};
+use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     extract::{
@@ -245,7 +245,13 @@ async fn handle_text(text: &str) -> WsResponse {
 /// Boot the TLS-terminated axum server. Blocks the current task forever
 /// (or until the runtime is dropped). Caller should spawn this in a
 /// dedicated tokio task so the Tauri event loop stays responsive.
-pub async fn serve(cert_pem: &Path, key_pem: &Path) -> Result<(), BridgeError> {
+///
+/// `cert_pem` and `key_pem` are passed as byte slices (not paths) so the
+/// production build can embed the cert via `include_bytes!`. That means
+/// the installer drops a single self-contained `.exe` — no loose `.pem`
+/// files in `C:\Program Files` and no permission errors when the
+/// installer can't reach `%PROGRAMFILES%`.
+pub async fn serve(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), BridgeError> {
     // rustls 0.23 requires picking a crypto provider explicitly at process
     // startup. We pick aws-lc-rs (FIPS-able, default in rustls). Safe to
     // call multiple times — `.ok()` swallows the "already installed" err
@@ -257,7 +263,7 @@ pub async fn serve(cert_pem: &Path, key_pem: &Path) -> Result<(), BridgeError> {
         version: env!("CARGO_PKG_VERSION"),
     };
 
-    let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_pem, key_pem)
+    let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.to_vec(), key_pem.to_vec())
         .await
         .map_err(|e| BridgeError::Tls(format!("load cert/key: {e}")))?;
 

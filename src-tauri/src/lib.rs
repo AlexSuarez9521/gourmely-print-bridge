@@ -17,6 +17,16 @@ pub mod tray;
 
 use tauri_plugin_autostart::MacosLauncher;
 
+/// TLS material embedded at compile time so the installer is a single
+/// self-contained .exe. The chain is the public Let's Encrypt cert
+/// (safe to bundle — it's served on every TLS handshake) plus the
+/// private key, which is acceptable to embed because every customer
+/// shares the same `localhost.gourmelyhub.busticco.com` cert (the DNS
+/// record only resolves to 127.0.0.1, so the attack surface is local).
+/// Same security model as QZ Tray's `localhost.qz.io` cert bundling.
+const CERT_PEM: &[u8] = include_bytes!("../certs/fullchain.pem");
+const KEY_PEM: &[u8] = include_bytes!("../certs/privkey.pem");
+
 /// Tauri command: returns the list of printers registered on this
 /// machine. Exposed both to the WSS clients (via `server::handle`) and
 /// to the Tauri webview UI (settings page can show what's available).
@@ -91,16 +101,6 @@ pub fn run() {
             is_autostart_enabled,
         ])
         .setup(|app| {
-            // Cert path resolution: env vars first (CI/dev), then a path
-            // relative to the binary (production install layout). The
-            // bridge refuses to boot if it can't find a usable cert.
-            let cert = std::env::var("PRINT_BRIDGE_CERT")
-                .unwrap_or_else(|_| "certs/fullchain.pem".to_string());
-            let key = std::env::var("PRINT_BRIDGE_KEY")
-                .unwrap_or_else(|_| "certs/privkey.pem".to_string());
-
-            tracing::info!("cert={} key={}", cert, key);
-
             // Install the system tray icon. Failure here is recoverable
             // (the WSS still works), but log loudly so a regression is
             // obvious in a support log.
@@ -109,11 +109,12 @@ pub fn run() {
             }
 
             // Spawn the server on Tauri's runtime so it shuts down
-            // cleanly when the app exits.
+            // cleanly when the app exits. Certs are embedded into the
+            // binary at compile time — no loose PEM files on disk
+            // means no permission errors and no support tickets about
+            // "I deleted that folder by mistake".
             tauri::async_runtime::spawn(async move {
-                if let Err(e) =
-                    server::serve(std::path::Path::new(&cert), std::path::Path::new(&key)).await
-                {
+                if let Err(e) = server::serve(CERT_PEM, KEY_PEM).await {
                     tracing::error!("server exited: {e}");
                 }
             });

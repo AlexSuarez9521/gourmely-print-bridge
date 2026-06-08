@@ -12,20 +12,19 @@
 //!   - Requires DNS `localhost.gourmelyhub.busticco.com → 127.0.0.1`
 //! Run explicitly with: `cargo test --test tls_smoke -- --ignored --nocapture`
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 #[tokio::test]
 #[ignore = "requires cert files + free port 8181 + DNS record; run with `--ignored`"]
 async fn tls_health_returns_200_with_real_cert() {
-    // Spawn the production server path in the background. If the cert
-    // is missing or malformed, this task panics and the test will hang
-    // — keeps the failure obvious.
-    let server_task = tokio::spawn(async {
-        print_bridge_lib::server::serve(
-            Path::new("certs/fullchain.pem"),
-            Path::new("certs/privkey.pem"),
-        )
-        .await
+    // Read cert + key from disk at test time so the smoke test exercises
+    // the same wire path as production (production embeds via
+    // include_bytes!, tests just read from the same `certs/` folder).
+    let cert = std::fs::read("certs/fullchain.pem").expect("certs/fullchain.pem must exist for smoke test");
+    let key = std::fs::read("certs/privkey.pem").expect("certs/privkey.pem must exist for smoke test");
+
+    let server_task = tokio::spawn(async move {
+        print_bridge_lib::server::serve(&cert, &key).await
     });
 
     // Tiny pause for the listener to be ready. axum_server is fast; 1s
