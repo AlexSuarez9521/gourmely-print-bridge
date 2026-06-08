@@ -45,3 +45,22 @@ fn find_printer(name: &str) -> BridgeResult<Printer> {
         .find(|p| p.name == name)
         .ok_or_else(|| BridgeError::PrinterNotFound(name.to_string()))
 }
+
+/// Canonical ESC/POS test ticket — used by both the tray menu and the
+/// WS `test` op so the two flows print byte-identical pages. Kept here
+/// so anything that wants "a known-good print job for QA" reaches for
+/// the same template.
+pub fn test_ticket_bytes() -> Vec<u8> {
+    let mut b = Vec::with_capacity(128);
+    // ESC @  init
+    // ESC a 0x01  center
+    // ESC ! 0x30  double height + width
+    b.extend_from_slice(b"\x1b@\x1ba\x01\x1b!\x30");
+    b.extend_from_slice("GOURMELYPRINT\n".as_bytes());
+    // ESC ! 0x00  normal size
+    b.extend_from_slice(b"\x1b!\x00");
+    b.extend_from_slice("Test desde el bridge\n\n".as_bytes());
+    // LF×4 + GS V 0x01  feed + partial cut
+    b.extend_from_slice(b"\x0a\x0a\x0a\x0a\x1dV\x01");
+    b
+}

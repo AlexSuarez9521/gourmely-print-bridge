@@ -16,8 +16,18 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # Tauri core
-tauri = { version = "2", features = [] }
+# `tray-icon` enables the system-tray API surface that we use for the
+# little ESC/POS-bridge icon next to the clock; without it the calls in
+# src/tray.rs don't compile.
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# Auto-start: registers HKCU\...\Run on Windows so the bridge wakes up
+# when the cashier logs into Windows. Opt-in (defaults to off).
+tauri-plugin-autostart = "2"
+# tauri-plugin-updater is *not* added yet: enabling it requires an
+# ed25519 keypair (the public half lives in tauri.conf.json, the private
+# half signs releases in CI). Phase 5 generates the pair, lands the
+# pubkey, and adds the dep + wiring in one shot.
 
 # Serialization / error
 serde = { version = "1", features = ["derive"] }

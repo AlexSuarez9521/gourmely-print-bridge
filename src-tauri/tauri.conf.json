@@ -49,5 +49,6 @@
         "language": "es-CO"
       }
     }
-  }
+  },
+  "plugins": {}
 }

@@ -229,7 +229,7 @@ async fn handle_text(text: &str) -> WsResponse {
             }
         }
         WsRequest::Test { id, printer: name } => {
-            let bytes = build_test_ticket();
+            let bytes = printer::test_ticket_bytes();
             match printer::print_raw(&name, &bytes) {
                 Ok(job_id) => WsResponse::PrintOk {
                     id,
@@ -240,16 +240,6 @@ async fn handle_text(text: &str) -> WsResponse {
             }
         }
     }
-}
-
-fn build_test_ticket() -> Vec<u8> {
-    let mut b = Vec::with_capacity(128);
-    b.extend_from_slice(b"\x1b@\x1ba\x01\x1b!\x30");
-    b.extend_from_slice("GOURMELYPRINT\n".as_bytes());
-    b.extend_from_slice(b"\x1b!\x00");
-    b.extend_from_slice("Test desde el bridge\n\n".as_bytes());
-    b.extend_from_slice(b"\x0a\x0a\x0a\x0a\x1dV\x01");
-    b
 }
 
 /// Boot the TLS-terminated axum server. Blocks the current task forever
