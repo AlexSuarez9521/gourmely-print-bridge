@@ -87,6 +87,23 @@ cargo test --test tls_smoke -- --ignored --nocapture    # full TLS + reqwest smo
 V1: `npm run tauri build` produces a `.msi` installer in
 `src-tauri/target/release/bundle/msi/`. Distribute via GitHub Releases.
 
+### Automated releases
+
+`.github/workflows/print-bridge-release.yml` builds and publishes the
+MSI on every `print-bridge-v*` tag (or manually via the workflow
+dispatch input).
+
+```bash
+# 1. Bump apps/print-bridge/src-tauri/tauri.conf.json :: version
+# 2. Bump apps/print-bridge/src-tauri/Cargo.toml      :: version
+# 3. Commit, push to dev, merge to main as usual
+# 4. Tag + push:
+git tag print-bridge-v0.1.1
+git push origin print-bridge-v0.1.1
+# 5. Watch the run in Actions → "Print Bridge Release"
+# 6. The new release with the MSI lands in the GitHub Releases page
+```
+
 V2 will add code signing (Sectigo cert) to remove the Windows
 SmartScreen prompt on first install.
 
