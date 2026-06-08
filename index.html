@@ -1,43 +1,113 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>GourmelyPrint Bridge</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
-
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
-
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-dot" id="status-dot" aria-hidden="true"></span>
+        <h1 class="brand-name">GourmelyPrint Bridge</h1>
+        <span class="brand-version" id="version"></span>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+      <p class="brand-tagline">Puente local de impresión para el POS de GourmelyHub.</p>
+    </header>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="status" role="tab">Estado</button>
+      <button class="tab" data-tab="printers" role="tab">Impresoras</button>
+      <button class="tab" data-tab="settings" role="tab">Ajustes</button>
+    </nav>
+
+    <main class="content">
+      <!-- ────── Estado ────── -->
+      <section class="panel is-active" data-panel="status">
+        <h2>Estado del servicio</h2>
+        <div class="status-grid">
+          <div class="status-card">
+            <span class="status-label">Conectividad</span>
+            <span class="status-value" id="conn-status">verificando…</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Impresoras detectadas</span>
+            <span class="status-value" id="printer-count">—</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Versión</span>
+            <span class="status-value" id="version-value">—</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Tiempo activo</span>
+            <span class="status-value" id="uptime">—</span>
+          </div>
+        </div>
+        <p class="hint">
+          Este servicio debe estar abierto mientras uses el POS. Se conecta al
+          navegador vía <code>wss://localhost.gourmelyhub.busticco.com:8181</code>.
+        </p>
+      </section>
+
+      <!-- ────── Impresoras ────── -->
+      <section class="panel" data-panel="printers">
+        <h2>Impresoras instaladas</h2>
+        <p class="hint">
+          Lista en vivo de las impresoras registradas en Windows. Si una no
+          aparece, revísala en <em>Configuración → Bluetooth y dispositivos → Impresoras</em>.
+        </p>
+        <ul class="printer-list" id="printer-list">
+          <li class="printer-empty">Cargando…</li>
+        </ul>
+      </section>
+
+      <!-- ────── Ajustes ────── -->
+      <section class="panel" data-panel="settings">
+        <h2>Ajustes</h2>
+        <div class="setting-row">
+          <label class="setting-label" for="autostart-toggle">
+            <span>Iniciar con Windows</span>
+            <span class="setting-help">
+              Arranca el bridge automáticamente cuando inicies sesión en
+              Windows. Recomendado para equipos de cajero.
+            </span>
+          </label>
+          <input
+            type="checkbox"
+            class="toggle"
+            id="autostart-toggle"
+            aria-label="Iniciar con Windows"
+          />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <span>Logs</span>
+            <span class="setting-help">
+              Carpeta donde se guardarán los registros de la app (uso de
+              soporte). Aún vacía en V1 — los logs se escriben aquí en V1.5.
+            </span>
+          </div>
+          <button class="btn-secondary" id="open-logs">Abrir carpeta</button>
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-label">
+            <span>Acerca de</span>
+            <span class="setting-help">
+              Open source bajo licencia MIT. Hosted en GitHub —
+              reportes y contribuciones bienvenidos.
+            </span>
+          </div>
+          <button class="btn-secondary" id="open-repo">Ver repositorio</button>
+        </div>
+      </section>
     </main>
+
+    <footer class="app-footer">
+      © 2026 GourmelyHub · MIT
+    </footer>
   </body>
 </html>
