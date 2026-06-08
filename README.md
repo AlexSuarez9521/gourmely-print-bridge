@@ -54,6 +54,13 @@ Convenience HTTP routes (same TLS server, no auth needed):
 - `GET /health` — JSON with version, uptime, printer count
 - `GET /printers` — JSON with the printer list
 
+## For restaurant operators
+
+You don't download from this repo. Open the GourmelyHub dashboard →
+**Configuración → Impresión → Instalar GourmelyPrint Bridge**, click
+the download button, run the installer, and follow the on-screen guide.
+The bridge auto-updates itself afterwards. This repo is for developers.
+
 ## Local dev
 
 Prereqs: Rust 1.96+ · Node 24+ · Visual Studio Build Tools 2022 · WebView2.
@@ -61,16 +68,11 @@ Prereqs: Rust 1.96+ · Node 24+ · Visual Studio Build Tools 2022 · WebView2.
 ```bash
 # Install deps
 npm install
-cd src-tauri
 
-# Get a Let's Encrypt cert (one-time; see ops/print-bridge-cert/)
-# Then copy fullchain.pem + privkey.pem into ./certs/
-
-# Build the Rust binary
-cargo build
+# The Let's Encrypt cert ships in src-tauri/certs/ (see SECURITY.md for
+# why it's committed). Nothing to set up for a normal build.
 
 # Run the bridge + frontend together
-cd ..
 npm run tauri dev
 ```
 
@@ -82,30 +84,36 @@ cargo test                                              # router + handler tests
 cargo test --test tls_smoke -- --ignored --nocapture    # full TLS + reqwest smoke
 ```
 
-## Distribution
+## Releases (maintainers)
 
-V1: `npm run tauri build` produces a `.msi` installer in
-`src-tauri/target/release/bundle/msi/`. Distribute via GitHub Releases.
-
-### Automated releases
-
-`.github/workflows/print-bridge-release.yml` builds and publishes the
-MSI on every `print-bridge-v*` tag (or manually via the workflow
-dispatch input).
+`.github/workflows/release.yml` builds and publishes the MSI on every
+`v*` tag (or manually via workflow dispatch). It also signs the MSI for
+the Tauri auto-updater and mirrors the artifacts to the Cloudflare R2
+download bucket the dashboard points at.
 
 ```bash
-# 1. Bump apps/print-bridge/src-tauri/tauri.conf.json :: version
-# 2. Bump apps/print-bridge/src-tauri/Cargo.toml      :: version
-# 3. Commit, push to dev, merge to main as usual
-# 4. Tag + push:
-git tag print-bridge-v0.1.1
-git push origin print-bridge-v0.1.1
-# 5. Watch the run in Actions → "Print Bridge Release"
-# 6. The new release with the MSI lands in the GitHub Releases page
+# 1. Bump version in src-tauri/tauri.conf.json AND src-tauri/Cargo.toml
+# 2. Commit + merge to main
+# 3. Tag + push:
+git tag v0.1.1
+git push origin v0.1.1
+# 4. Watch Actions → "Release"
 ```
 
-V2 will add code signing (Sectigo cert) to remove the Windows
-SmartScreen prompt on first install.
+The Let's Encrypt cert is rotated automatically every 60 days by
+`.github/workflows/cert-renew.yml` — see [ops/README.md](ops/README.md).
+
+Code signing (to remove the Windows SmartScreen prompt) activates
+automatically once the `WINDOWS_CODE_SIGN_PFX_BASE64` secret is set.
+
+## Security
+
+The committed TLS private key is safe by design — see
+[SECURITY.md](SECURITY.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

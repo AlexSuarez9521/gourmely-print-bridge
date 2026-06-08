@@ -6,5 +6,8 @@
 # will have schema files for capabilities auto-completion
 /gen/schemas
 
-# Local dev certs — managed by ops/print-bridge-cert/, never commit
-certs/
+# NOTE: certs/ IS committed on purpose in this repo. The Let's Encrypt
+# cert for localhost.gourmelyhub.busticco.com is embedded into the
+# binary via include_bytes! at compile time, so CI needs it in the
+# checkout. The private key is safe to publish — see SECURITY.md
+# (the domain only resolves to 127.0.0.1, there is no MITM position).

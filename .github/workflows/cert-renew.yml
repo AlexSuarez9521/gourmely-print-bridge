@@ -1,0 +1,164 @@
+name: Cert Renewal
+
+# Renews the Let's Encrypt cert for localhost.gourmelyhub.busticco.com,
+# embeds the new pem files in src-tauri/certs/, bumps the patch version,
+# and opens a pull request against main. Merging the PR + tagging
+# `v<new-version>` re-triggers the release pipeline so every customer
+# gets the new cert via the next installer update (or the Tauri
+# auto-updater).
+#
+# Let's Encrypt certs are valid 90 days. We run every 60 days to keep a
+# 30-day safety buffer.
+#
+# Required secrets:
+#   - CLOUDFLARE_DNS_API_TOKEN : token with Zone:Read + DNS:Edit scope
+#                                limited to the busticco.com zone.
+#   - CERT_RENEWAL_PR_TOKEN    : PAT (or app token) with `repo` scope so
+#                                the workflow can open a PR. GITHUB_TOKEN
+#                                won't trigger downstream workflows from
+#                                the new branch.
+
+on:
+  schedule:
+    # Every 60 days at 03:00 UTC.
+    - cron: "0 3 1 */2 *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, run certbot in --dry-run mode (no real cert issued)."
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cert-renewal
+  cancel-in-progress: false
+
+env:
+  DOMAIN: "localhost.gourmelyhub.busticco.com"
+  CERT_EMAIL: "alexsuarez9521@gmail.com"
+
+jobs:
+  renew:
+    name: Renew Let's Encrypt cert
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.CERT_RENEWAL_PR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install certbot + Cloudflare DNS plugin
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y certbot python3-certbot-dns-cloudflare
+
+      - name: Write Cloudflare credentials
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_DNS_API_TOKEN }}
+        run: |
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_DNS_API_TOKEN secret is not set"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/cf"
+          chmod 700 "$RUNNER_TEMP/cf"
+          cat > "$RUNNER_TEMP/cf/credentials.ini" <<EOF
+          dns_cloudflare_api_token = $CF_TOKEN
+          EOF
+          chmod 600 "$RUNNER_TEMP/cf/credentials.ini"
+
+      - name: Issue / renew cert via DNS-01
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/le"
+          DRY_FLAG=""
+          if [ "$DRY_RUN" = "true" ]; then
+            DRY_FLAG="--dry-run"
+          fi
+          sudo certbot certonly \
+            --non-interactive \
+            --agree-tos \
+            --email "$CERT_EMAIL" \
+            --dns-cloudflare \
+            --dns-cloudflare-credentials "$RUNNER_TEMP/cf/credentials.ini" \
+            --dns-cloudflare-propagation-seconds 30 \
+            --config-dir "$RUNNER_TEMP/le/config" \
+            --work-dir "$RUNNER_TEMP/le/work" \
+            --logs-dir "$RUNNER_TEMP/le/logs" \
+            -d "$DOMAIN" \
+            $DRY_FLAG
+
+      - name: Copy new cert into the bridge
+        if: inputs.dry_run != 'true'
+        run: |
+          LIVE_DIR="$RUNNER_TEMP/le/config/live/$DOMAIN"
+          if [ ! -f "$LIVE_DIR/fullchain.pem" ] || [ ! -f "$LIVE_DIR/privkey.pem" ]; then
+            echo "::error::certbot did not produce live cert files at $LIVE_DIR"
+            ls -la "$LIVE_DIR" || true
+            exit 1
+          fi
+          sudo cp "$LIVE_DIR/fullchain.pem" src-tauri/certs/fullchain.pem
+          sudo cp "$LIVE_DIR/privkey.pem"   src-tauri/certs/privkey.pem
+          sudo chown "$(id -u):$(id -g)" src-tauri/certs/*.pem
+
+      - name: Bump bridge patch version
+        id: bump
+        if: inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          CONF="src-tauri/tauri.conf.json"
+          CARGO="src-tauri/Cargo.toml"
+
+          OLD=$(python3 -c "import json; print(json.load(open('$CONF'))['version'])")
+          MAJOR=$(echo "$OLD" | cut -d. -f1)
+          MINOR=$(echo "$OLD" | cut -d. -f2)
+          PATCH=$(echo "$OLD" | cut -d. -f3)
+          NEW="$MAJOR.$MINOR.$((PATCH+1))"
+
+          python3 -c "import json, sys; p='$CONF'; c=json.load(open(p)); c['version']='$NEW'; open(p,'w').write(json.dumps(c, indent=2) + '\n')"
+
+          # Cargo.toml version line — only the first occurrence (under [package]).
+          awk -v new="$NEW" '
+            BEGIN { done = 0 }
+            /^\[package\]/ { in_pkg = 1 }
+            /^\[/ && !/^\[package\]/ { in_pkg = 0 }
+            in_pkg && /^version[[:space:]]*=/ && !done { print "version = \"" new "\""; done = 1; next }
+            { print }
+          ' "$CARGO" > "$CARGO.tmp" && mv "$CARGO.tmp" "$CARGO"
+
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: inputs.dry_run != 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.CERT_RENEWAL_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          base: main
+          branch: ci/cert-renewal
+          delete-branch: true
+          commit-message: "chore: renew TLS cert and bump to v${{ steps.bump.outputs.new }}"
+          title: "chore: renew TLS cert + bump to v${{ steps.bump.outputs.new }}"
+          body: |
+            Automated Let's Encrypt cert renewal for `${{ env.DOMAIN }}`.
+
+            - New cert lives at `src-tauri/certs/`
+            - Bridge version bumped: `${{ steps.bump.outputs.old }}` → `${{ steps.bump.outputs.new }}`
+
+            After merge: tag `v${{ steps.bump.outputs.new }}` to trigger the release pipeline so every customer gets the new cert in the next installer / auto-update.
+          labels: |
+            automated
+
+      - name: Cleanup credentials
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/cf" "$RUNNER_TEMP/le" || true

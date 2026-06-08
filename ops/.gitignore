@@ -1,0 +1,4 @@
+# Sensitive — NEVER commit
+credentials/
+letsencrypt/
+logs/

@@ -1,0 +1,7 @@
+# PEM certs are embedded into the binary via include_bytes! at compile
+# time. Git must NOT rewrite their line endings — a CRLF conversion on
+# a CI checkout would change the embedded bytes and break TLS parsing.
+*.pem -text
+
+# Keep shell scripts LF so they run on the Linux CI runners.
+*.sh text eol=lf
