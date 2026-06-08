@@ -1,0 +1,60 @@
+[package]
+name = "print-bridge"
+version = "0.1.0"
+description = "Local print bridge for GourmelyHub POS — open source replacement for QZ Tray"
+authors = ["GourmelyHub <contacto@busticco.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/AlexSuarez9521/GourmelyHub"
+
+[lib]
+name = "print_bridge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri core
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# Serialization / error
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# Async runtime + HTTP server
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "signal", "fs"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# TLS — explicit aws-lc-rs feature picks the FIPS-friendly crypto provider.
+# rustls 0.23 dropped the implicit default; if you don't pick one here the
+# server panics at startup with "Could not automatically determine the
+# process-level CryptoProvider".
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
+
+# Logs
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Printer access — abstracts over Windows print spooler / CUPS so our
+# code stays simple and cross-platform-friendly.
+printers = "2"
+
+[dev-dependencies]
+axum-test = "16"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

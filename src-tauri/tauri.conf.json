@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GourmelyPrint Bridge",
+  "version": "0.1.0",
+  "identifier": "co.gourmelyhub.print-bridge",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "GourmelyPrint Bridge",
+        "width": 720,
+        "height": 540,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false,
+        "decorations": true,
+        "transparent": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "msi",
+    "publisher": "GourmelyHub",
+    "homepage": "https://gourmelyhub.busticco.com",
+    "shortDescription": "Local print bridge for GourmelyHub POS — sends ESC/POS receipts to your thermal printer.",
+    "longDescription": "GourmelyPrint Bridge is a free, open source local service that connects the GourmelyHub web POS to USB thermal printers on this computer. It runs in the system tray and listens for print jobs from the POS, forwarding raw ESC/POS commands to the Windows print spooler.",
+    "category": "Business",
+    "copyright": "Copyright © 2026 GourmelyHub. MIT License.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": {
+        "language": "es-CO"
+      }
+    }
+  }
+}
