@@ -31,6 +31,7 @@
   "bundle": {
     "active": true,
     "targets": "msi",
+    "createUpdaterArtifacts": true,
     "publisher": "GourmelyHub",
     "homepage": "https://gourmelyhub.busticco.com",
     "shortDescription": "Local print bridge for GourmelyHub POS — sends ESC/POS receipts to your thermal printer.",
@@ -50,5 +51,10 @@
       }
     }
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "endpoints": ["https://downloads.gourmelyhub.busticco.com/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU0QUM5NUE4MjgyQzA2NzAKUldSd0Jpd29xSldzNUlRQU5xcDF1WEVNTUJ5bmxqU09qSFNFQTMvRU0xUHlpd1VZRk9sS1hsNksK"
+    }
+  }
 }

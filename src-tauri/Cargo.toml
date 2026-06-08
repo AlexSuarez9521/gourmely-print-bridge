@@ -24,10 +24,14 @@ tauri-plugin-opener = "2"
 # Auto-start: registers HKCU\...\Run on Windows so the bridge wakes up
 # when the cashier logs into Windows. Opt-in (defaults to off).
 tauri-plugin-autostart = "2"
-# tauri-plugin-updater is *not* added yet: enabling it requires an
-# ed25519 keypair (the public half lives in tauri.conf.json, the private
-# half signs releases in CI). Phase 5 generates the pair, lands the
-# pubkey, and adds the dep + wiring in one shot.
+# Auto-update: checks the signed `latest.json` manifest on the R2
+# download mirror and applies updates with the user's one-click
+# consent. The public verification key lives in
+# tauri.conf.json > plugins.updater.pubkey; the private signing key is
+# injected into CI as the TAURI_SIGNING_PRIVATE_KEY secret.
+tauri-plugin-updater = "2"
+# `process` lets us relaunch the app after an update is installed.
+tauri-plugin-process = "2"
 
 # Serialization / error
 serde = { version = "1", features = ["derive"] }

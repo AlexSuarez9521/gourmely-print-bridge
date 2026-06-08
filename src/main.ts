@@ -8,6 +8,10 @@
  */
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl, openPath } from '@tauri-apps/plugin-opener';
+import { check, type Update } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
+
+const REPO_URL = 'https://github.com/AlexSuarez9521/gourmely-print-bridge';
 
 const APP_BOOT_AT = Date.now();
 const TICK_MS = 5_000;
@@ -152,13 +156,7 @@ async function initSettings() {
 
   document.getElementById('open-logs')?.addEventListener('click', async () => {
     try {
-      // path resolved on the Rust side via app.path().app_log_dir(); the
-      // tray menu uses the same handler, but exposing it from JS without a
-      // dedicated command would force us to mirror that logic, so for now
-      // we open the repo docs which explain where the logs will live.
-      await openUrl(
-        'https://github.com/AlexSuarez9421/GourmelyHub/tree/main/apps/print-bridge#logs',
-      );
+      await openUrl(`${REPO_URL}#logs`);
     } catch (e) {
       console.error('open logs failed', e);
     }
@@ -166,9 +164,75 @@ async function initSettings() {
 
   document.getElementById('open-repo')?.addEventListener('click', async () => {
     try {
-      await openUrl('https://github.com/AlexSuarez9521/GourmelyHub/tree/main/apps/print-bridge');
+      await openUrl(REPO_URL);
     } catch (e) {
       console.error('open repo failed', e);
+    }
+  });
+}
+
+// ─── Auto-update ─────────────────────────────────────────────────────
+
+/**
+ * Check the signed `latest.json` manifest for a newer version. When one
+ * is available, show a banner with one-click "Instalar" + "Después".
+ * The check is best-effort — a network failure (offline cashier PC) is
+ * silently ignored so it never blocks the bridge from running.
+ */
+async function checkForUpdate() {
+  let update: Update | null = null;
+  try {
+    update = await check();
+  } catch (e) {
+    console.warn('update check failed (offline?)', e);
+    return;
+  }
+  if (!update?.available) return;
+  showUpdateBanner(update);
+}
+
+function showUpdateBanner(update: Update) {
+  // Build the banner once, lazily, so the happy path (no update) adds
+  // zero DOM. Inserted at the top of the app shell.
+  let banner = document.getElementById('update-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'update-banner';
+    banner.className = 'update-banner';
+    document.body.prepend(banner);
+  }
+  banner.innerHTML = `
+    <span class="update-text">Nueva versión ${update.version} disponible.</span>
+    <button class="btn-primary" id="update-install">Instalar y reiniciar</button>
+    <button class="btn-ghost" id="update-later">Después</button>
+  `;
+
+  document.getElementById('update-later')?.addEventListener('click', () => {
+    banner?.remove();
+  });
+
+  document.getElementById('update-install')?.addEventListener('click', async () => {
+    const installBtn = document.getElementById('update-install') as HTMLButtonElement | null;
+    const laterBtn = document.getElementById('update-later') as HTMLButtonElement | null;
+    if (installBtn) {
+      installBtn.disabled = true;
+      installBtn.textContent = 'Descargando…';
+    }
+    if (laterBtn) laterBtn.disabled = true;
+    try {
+      // downloadAndInstall streams progress events; we keep the UI
+      // simple and just flip the label. On Windows the MSI installer
+      // runs and the app exits, so relaunch() resumes it.
+      await update.downloadAndInstall();
+      if (installBtn) installBtn.textContent = 'Reiniciando…';
+      await relaunch();
+    } catch (e) {
+      console.error('update install failed', e);
+      if (installBtn) {
+        installBtn.disabled = false;
+        installBtn.textContent = 'Reintentar';
+      }
+      if (laterBtn) laterBtn.disabled = false;
     }
   });
 }
@@ -181,6 +245,8 @@ window.addEventListener('DOMContentLoaded', () => {
   refreshStatus();
   refreshPrinterList();
   setInterval(refreshStatus, TICK_MS);
+  // Best-effort update check on boot. Never blocks the UI.
+  void checkForUpdate();
   console.info(`GourmelyPrint Bridge UI booted at ${new Date(APP_BOOT_AT).toISOString()}`);
 });
 

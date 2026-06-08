@@ -1,10 +1,13 @@
 name: Release
 
 # Triggered by pushing a tag like `v0.1.0`, or manually via the
-# workflow dispatch. Builds the Windows MSI installer and uploads it to
-# a GitHub Release named after the tag. Customers never see this repo —
-# they download the MSI from the GourmelyHub dashboard, which points at
-# the Cloudflare R2 mirror this workflow publishes to.
+# workflow dispatch. Builds + signs the Windows MSI, publishes a GitHub
+# Release, and mirrors the artifacts (MSI + updater manifest) to the
+# Cloudflare R2 bucket the GourmelyHub dashboard links to.
+#
+# Customers never see this repo: they download `bridge-latest.msi` from
+# `https://downloads.gourmelyhub.busticco.com/` and auto-update against
+# `latest.json` on the same host.
 
 on:
   push:
@@ -27,10 +30,11 @@ concurrency:
 env:
   NODE_VERSION: "24"
   RUST_TOOLCHAIN: "stable"
+  R2_BUCKET: "gourmelyhub-print-bridge-downloads"
 
 jobs:
   build:
-    name: Build Windows MSI
+    name: Build + sign Windows MSI
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -75,13 +79,12 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Tauri build emits the MSI to:
-      #   src-tauri/target/release/bundle/msi/GourmelyPrint Bridge_<version>_x64_en-US.msi
-      # The Let's Encrypt cert is embedded via include_bytes! so no extra
-      # resources need wiring into the installer. The updater signature
-      # (.msi.sig) is produced when the TAURI_SIGNING_PRIVATE_KEY secret
-      # is set — see the Tauri updater plugin docs.
-      - name: Build Tauri MSI
+      # `createUpdaterArtifacts: true` in tauri.conf.json makes the build
+      # emit `<app>_<version>_x64_en-US.msi` AND a detached updater
+      # signature `<...>.msi.sig`, signed with TAURI_SIGNING_PRIVATE_KEY.
+      # If WINDOWS_CODE_SIGN_PFX_BASE64 is set (Fase 6), the MSI is also
+      # Authenticode-signed to remove the SmartScreen prompt.
+      - name: Build + sign Tauri MSI
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -91,19 +94,21 @@ jobs:
         run: dir src-tauri\target\release\bundle\msi
         shell: cmd
 
-      - name: Upload MSI artifact
+      - name: Upload MSI + signature artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gourmelyprint-bridge-msi
-          path: src-tauri/target/release/bundle/msi/*
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
           retention-days: 30
           if-no-files-found: error
 
-  release:
-    name: Publish GitHub Release
+  publish:
+    name: Publish Release + mirror to R2
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
 
     steps:
@@ -112,37 +117,98 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - name: Download MSI artifact
+      - name: Download MSI artifacts
         uses: actions/download-artifact@v5
         with:
           name: gourmelyprint-bridge-msi
-          path: ./release-assets
+          path: ./assets
 
-      - name: Resolve tag name
-        id: tag
+      - name: Resolve tag + version
+        id: meta
         run: |
+          set -euo pipefail
           if [ -n "${{ inputs.tag }}" ]; then
-            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            TAG="${{ inputs.tag }}"
           else
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            TAG="${GITHUB_REF#refs/tags/}"
           fi
+          # tauri.conf.json version is the source of truth for the manifest.
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          MSI=$(ls assets/*.msi | head -1)
+          SIG=$(ls assets/*.msi.sig | head -1)
+          echo "msi_path=$MSI" >> "$GITHUB_OUTPUT"
+          echo "sig_path=$SIG" >> "$GITHUB_OUTPUT"
+
+      - name: Build updater manifest (latest.json)
+        id: manifest
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          SIG_CONTENT=$(cat "${{ steps.meta.outputs.sig_path }}")
+          DOWNLOAD_URL="https://downloads.gourmelyhub.busticco.com/bridge-${VERSION}.msi"
+          # pub_date must be RFC3339. Use the tag's commit date so the
+          # manifest is reproducible (no Date.now in this repo's tooling).
+          PUB_DATE=$(git log -1 --format=%cI)
+
+          python3 - "$VERSION" "$SIG_CONTENT" "$DOWNLOAD_URL" "$PUB_DATE" <<'PY'
+          import json, sys
+          version, sig, url, pub_date = sys.argv[1:5]
+          manifest = {
+              "version": version,
+              "notes": "See the GitHub release notes for this version.",
+              "pub_date": pub_date,
+              "platforms": {
+                  "windows-x86_64": {"signature": sig, "url": url},
+              },
+          }
+          with open("latest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          PY
+          echo "Built latest.json:"
+          cat latest.json
+
+      - name: Configure AWS CLI for Cloudflare R2
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          aws configure set region auto
+
+      - name: Upload to R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_S3_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          MSI="${{ steps.meta.outputs.msi_path }}"
+
+          # Versioned MSI (permanent), latest alias (overwritten), manifest.
+          aws s3 cp "$MSI" "s3://${R2_BUCKET}/bridge-${VERSION}.msi" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/x-msi
+          aws s3 cp "$MSI" "s3://${R2_BUCKET}/bridge-latest.msi" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/x-msi
+          aws s3 cp latest.json "s3://${R2_BUCKET}/latest.json" \
+            --endpoint-url "$R2_ENDPOINT" --content-type application/json \
+            --cache-control "no-cache"
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release-assets/*.msi
+            assets/*.msi
+            assets/*.msi.sig
+            latest.json
           body: |
             GourmelyPrint Bridge — local print service for GourmelyHub POS.
 
             ## Install
-            1. Download the `.msi` from the assets below.
-            2. Run the installer (Windows SmartScreen may warn until the binary is signed — click "More info → Run anyway").
-            3. After install, the bridge starts on next login and listens on `wss://localhost.gourmelyhub.busticco.com:8181/print`.
+            Download from the GourmelyHub dashboard (Configuración → Impresión → Instalar GourmelyPrint Bridge), or grab the `.msi` below.
 
-            ## Verify
-            From the POS, open the digital receipt modal — a green dot should appear next to "GourmelyPrint Bridge conectado".
+            ## Auto-update
+            Installed bridges check `latest.json` on boot and offer a one-click update — no reinstall needed.

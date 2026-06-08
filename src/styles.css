@@ -331,6 +331,60 @@ code {
   background: var(--border);
 }
 
+.btn-ghost {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.btn-ghost:hover {
+  color: var(--text);
+}
+
+.btn-ghost:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ─── Update banner ────────────────────────────────────────────── */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: var(--primary);
+  color: white;
+  font-size: 13px;
+}
+
+.update-banner .update-text {
+  flex: 1;
+  font-weight: 500;
+}
+
+.update-banner .btn-primary {
+  background: white;
+  color: var(--primary);
+}
+
+.update-banner .btn-primary:hover {
+  background: rgba(255, 255, 255, 0.85);
+}
+
+.update-banner .btn-ghost {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.update-banner .btn-ghost:hover {
+  color: white;
+}
+
 /* ─── Footer ───────────────────────────────────────────────────── */
 
 .app-footer {
