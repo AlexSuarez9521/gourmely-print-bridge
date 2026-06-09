@@ -6,16 +6,16 @@
 //! support call.
 //!
 //! Menu:
-//!   • Estado: <connected / idle / error>     (header, disabled)
+//!   • GourmelyPrint Bridge                   (header, disabled — branding)
 //!   • Abrir configuración                    (opens main window)
 //!   • Imprimir prueba                        (sends a test ticket to the default printer)
-//!   • Ver logs                               (opens %APPDATA%\..\logs)
-//!   • Acerca de                              (opens website)
 //!   • Salir                                  (quits the process)
 //!
-//! Icon color is wired through the global state (server.rs's
-//! ServerState) so a future "show red when last print errored" only
-//! needs to flip a bool — no menu rewiring.
+//! Kept deliberately small — every extra item is a support call. The
+//! live status (connected / version / uptime) lives in the settings
+//! window, not the tray, so the menu has no stale "iniciando…" label.
+//! "Ver logs" and "Acerca de" were removed: logs aren't written in V1
+//! and "Acerca de" linked to GitHub, which customers shouldn't see.
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -30,33 +30,22 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
     // Menu items — created up front so we can attach them to the menu
     // and to the click handler in one builder pass.
-    let status = MenuItem::with_id(
+    let header = MenuItem::with_id(
         &handle,
-        "status",
-        "Estado: iniciando…",
-        false, // disabled — it's a label
+        "header",
+        "GourmelyPrint Bridge",
+        false, // disabled — branding label, not a clickable item
         None::<&str>,
     )?;
     let sep1 = PredefinedMenuItem::separator(&handle)?;
     let open_settings = MenuItem::with_id(&handle, "open", "Abrir configuración", true, None::<&str>)?;
     let test_print = MenuItem::with_id(&handle, "test", "Imprimir prueba", true, None::<&str>)?;
-    let view_logs = MenuItem::with_id(&handle, "logs", "Ver logs", true, None::<&str>)?;
-    let about = MenuItem::with_id(&handle, "about", "Acerca de", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(&handle)?;
     let quit = MenuItem::with_id(&handle, "quit", "Salir", true, None::<&str>)?;
 
     let menu = Menu::with_items(
         &handle,
-        &[
-            &status,
-            &sep1,
-            &open_settings,
-            &test_print,
-            &view_logs,
-            &about,
-            &sep2,
-            &quit,
-        ],
+        &[&header, &sep1, &open_settings, &test_print, &sep2, &quit],
     )?;
 
     TrayIconBuilder::with_id("main")
@@ -67,8 +56,6 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
             "test" => spawn_test_print(app),
-            "logs" => open_logs_folder(app),
-            "about" => open_about_url(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -115,27 +102,3 @@ fn spawn_test_print<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
-fn open_logs_folder<R: Runtime>(app: &AppHandle<R>) {
-    // Logs live next to the app data dir. We don't strictly write to a
-    // file yet (V1.5 will), but opening the folder makes future log
-    // reads zero-effort for support.
-    let Ok(dir) = app.path().app_log_dir() else {
-        tracing::warn!("could not resolve app_log_dir");
-        return;
-    };
-    // Best-effort: create the dir so the explorer window isn't empty
-    // before we land file logging.
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.to_string_lossy().to_string();
-    tracing::info!("opening logs folder: {}", path);
-    if let Err(e) = tauri_plugin_opener::open_path(path, None::<&str>) {
-        tracing::error!("open logs folder: {e}");
-    }
-}
-
-fn open_about_url<R: Runtime>(_app: &AppHandle<R>) {
-    let _ = tauri_plugin_opener::open_url(
-        "https://github.com/AlexSuarez9521/GourmelyHub/tree/main/apps/print-bridge",
-        None::<&str>,
-    );
-}

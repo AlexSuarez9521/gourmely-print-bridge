@@ -1,6 +1,6 @@
 [package]
 name = "print-bridge"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local print bridge for GourmelyHub POS — open source replacement for QZ Tray"
 authors = ["GourmelyHub <contacto@busticco.com>"]
 edition = "2021"

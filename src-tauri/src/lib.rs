@@ -15,6 +15,7 @@ pub mod printer;
 pub mod server;
 pub mod tray;
 
+use tauri::WindowEvent;
 use tauri_plugin_autostart::MacosLauncher;
 
 /// TLS material embedded at compile time so the installer is a single
@@ -102,6 +103,17 @@ pub fn run() {
             set_autostart,
             is_autostart_enabled,
         ])
+        // Close-to-tray: clicking the window's X must NOT quit the
+        // bridge — that would silently kill printing for the whole POS.
+        // Instead we hide the window back to the system tray. The only
+        // way to actually quit is the tray menu's "Salir". This is the
+        // expected behaviour for a background service.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             // Install the system tray icon. Failure here is recoverable
             // (the WSS still works), but log loudly so a regression is
