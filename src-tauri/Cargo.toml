@@ -1,6 +1,6 @@
 [package]
 name = "print-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local print bridge for GourmelyHub POS — open source replacement for QZ Tray"
 authors = ["GourmelyHub <contacto@busticco.com>"]
 edition = "2021"
@@ -46,7 +46,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 axum = { version = "0.7", features = ["ws", "macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
 
 # TLS — explicit aws-lc-rs feature picks the FIPS-friendly crypto provider.
 # rustls 0.23 dropped the implicit default; if you don't pick one here the

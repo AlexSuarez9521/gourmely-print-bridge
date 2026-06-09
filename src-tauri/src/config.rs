@@ -19,6 +19,14 @@ pub const BRIDGE_HOST: &str = "localhost.gourmelyhub.busticco.com";
 pub const ALLOWED_ORIGINS: &[&str] = &[
     "https://app-gourmelyhub.busticco.com",
     "https://gourmelyhub.busticco.com",
+    // The bridge's OWN settings window (Tauri WebView2) fetches /health
+    // for the status badge. Its origin is tauri.localhost on Windows /
+    // tauri://localhost on macOS — without these the badge showed
+    // "Sin conexión" even though the service was up (CORS-blocked the
+    // self-fetch). 2026-06-09 fix.
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "tauri://localhost",
     // Dev origins — keep these only while we're testing locally. Strip
     // before release builds.
     "http://localhost:3000",

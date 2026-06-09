@@ -22,7 +22,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -30,6 +30,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::{
     config::{ALLOWED_ORIGINS, BIND_PORT, MAX_PRINT_BYTES},
@@ -125,11 +126,24 @@ fn build_router(state: ServerState) -> Router {
         .allow_origin(allowed)
         .allow_headers(Any);
 
+    // Private Network Access: when a public origin (the POS at
+    // app-gourmelyhub.busticco.com) fetches a loopback address, Chrome
+    // sends a PNA preflight and blocks the request unless the response
+    // carries `Access-Control-Allow-Private-Network: true`. Without this
+    // every customer would have to disable chrome://flags by hand —
+    // breaking the one-click install promise. We set it on every
+    // response (cheap, harmless on non-preflight requests). 2026-06-09.
+    let pna = SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("access-control-allow-private-network"),
+        HeaderValue::from_static("true"),
+    );
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/printers", get(printers_handler))
         .route("/print", get(print_ws_handler))
         .layer(cors)
+        .layer(pna)
         .with_state(state)
 }
 

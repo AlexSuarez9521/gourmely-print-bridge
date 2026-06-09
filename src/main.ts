@@ -7,11 +7,8 @@
  * smaller when we ship a Windows installer.
  */
 import { invoke } from '@tauri-apps/api/core';
-import { openUrl, openPath } from '@tauri-apps/plugin-opener';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
-
-const REPO_URL = 'https://github.com/AlexSuarez9521/gourmely-print-bridge';
 
 const APP_BOOT_AT = Date.now();
 const TICK_MS = 5_000;
@@ -154,21 +151,6 @@ async function initSettings() {
     });
   }
 
-  document.getElementById('open-logs')?.addEventListener('click', async () => {
-    try {
-      await openUrl(`${REPO_URL}#logs`);
-    } catch (e) {
-      console.error('open logs failed', e);
-    }
-  });
-
-  document.getElementById('open-repo')?.addEventListener('click', async () => {
-    try {
-      await openUrl(REPO_URL);
-    } catch (e) {
-      console.error('open repo failed', e);
-    }
-  });
 }
 
 // ─── Auto-update ─────────────────────────────────────────────────────
@@ -249,8 +231,3 @@ window.addEventListener('DOMContentLoaded', () => {
   void checkForUpdate();
   console.info(`GourmelyPrint Bridge UI booted at ${new Date(APP_BOOT_AT).toISOString()}`);
 });
-
-// Touch openPath so TS doesn't whine about unused import. The path
-// helper is here for when V1.5 exposes a dedicated `get_log_dir`
-// command and we can pass the resolved path to openPath().
-void openPath;
