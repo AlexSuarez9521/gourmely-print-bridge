@@ -87,9 +87,12 @@ cargo test --test tls_smoke -- --ignored --nocapture    # full TLS + reqwest smo
 ## Releases (maintainers)
 
 `.github/workflows/release.yml` builds and publishes the MSI on every
-`v*` tag (or manually via workflow dispatch). It also signs the MSI for
-the Tauri auto-updater and mirrors the artifacts to the Cloudflare R2
-download bucket the dashboard points at.
+`v*` tag (or manually via workflow dispatch). It signs the MSI for the
+Tauri auto-updater and publishes a GitHub Release with a stable-named
+asset (`GourmelyPrint-Bridge-setup.msi`). The dashboard download button
+and the updater both use the permanent `/releases/latest/download/` URL,
+so customers always get the newest build from a single direct-download
+link — they never browse this repo.
 
 ```bash
 # 1. Bump version in src-tauri/tauri.conf.json AND src-tauri/Cargo.toml

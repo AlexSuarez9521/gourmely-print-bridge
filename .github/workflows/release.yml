@@ -1,13 +1,17 @@
 name: Release
 
 # Triggered by pushing a tag like `v0.1.0`, or manually via the
-# workflow dispatch. Builds + signs the Windows MSI, publishes a GitHub
-# Release, and mirrors the artifacts (MSI + updater manifest) to the
-# Cloudflare R2 bucket the GourmelyHub dashboard links to.
+# workflow dispatch. Builds + signs the Windows MSI and publishes a
+# GitHub Release with a STABLE-named installer asset.
 #
-# Customers never see this repo: they download `bridge-latest.msi` from
-# `https://downloads.gourmelyhub.busticco.com/` and auto-update against
-# `latest.json` on the same host.
+# Customers never see this repo. The GourmelyHub dashboard "Descargar"
+# button points at:
+#   https://github.com/<repo>/releases/latest/download/GourmelyPrint-Bridge-setup.msi
+# which is a direct single-file download (302 → the .msi). The browser
+# downloads one file; the customer double-clicks it. No repo, no GitHub
+# page, no navigation.
+#
+# The Tauri auto-updater reads latest.json from the same stable URL.
 
 on:
   push:
@@ -30,7 +34,9 @@ concurrency:
 env:
   NODE_VERSION: "24"
   RUST_TOOLCHAIN: "stable"
-  R2_BUCKET: "gourmelyhub-print-bridge-downloads"
+  # Stable, version-less installer name so the dashboard download button
+  # and the updater manifest can use a permanent /releases/latest/ URL.
+  INSTALLER_NAME: "GourmelyPrint-Bridge-setup.msi"
 
 jobs:
   build:
@@ -105,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish Release + mirror to R2
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -123,7 +129,7 @@ jobs:
           name: gourmelyprint-bridge-msi
           path: ./assets
 
-      - name: Resolve tag + version
+      - name: Resolve tag + version, rename installer to stable name
         id: meta
         run: |
           set -euo pipefail
@@ -137,18 +143,24 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          MSI=$(ls assets/*.msi | head -1)
+          SRC_MSI=$(ls assets/*.msi | head -1)
           SIG=$(ls assets/*.msi.sig | head -1)
-          echo "msi_path=$MSI" >> "$GITHUB_OUTPUT"
+
+          # Copy the built MSI to a stable, version-less name so the
+          # dashboard button + updater can use a permanent URL:
+          #   /releases/latest/download/GourmelyPrint-Bridge-setup.msi
+          # Renaming does not alter the bytes, so the .sig stays valid.
+          cp "$SRC_MSI" "assets/${{ env.INSTALLER_NAME }}"
           echo "sig_path=$SIG" >> "$GITHUB_OUTPUT"
 
       - name: Build updater manifest (latest.json)
-        id: manifest
         run: |
           set -euo pipefail
           VERSION="${{ steps.meta.outputs.version }}"
           SIG_CONTENT=$(cat "${{ steps.meta.outputs.sig_path }}")
-          DOWNLOAD_URL="https://downloads.gourmelyhub.busticco.com/bridge-${VERSION}.msi"
+          # The updater downloads the stable installer from the latest
+          # release. Permanent URL — always resolves to the newest MSI.
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/latest/download/${{ env.INSTALLER_NAME }}"
           # pub_date must be RFC3339. Use the tag's commit date so the
           # manifest is reproducible (no Date.now in this repo's tooling).
           PUB_DATE=$(git log -1 --format=%cI)
@@ -170,29 +182,6 @@ jobs:
           echo "Built latest.json:"
           cat latest.json
 
-      - name: Configure AWS CLI for Cloudflare R2
-        run: |
-          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
-          aws configure set region auto
-
-      - name: Upload to R2
-        env:
-          R2_ENDPOINT: ${{ secrets.R2_S3_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.meta.outputs.version }}"
-          MSI="${{ steps.meta.outputs.msi_path }}"
-
-          # Versioned MSI (permanent), latest alias (overwritten), manifest.
-          aws s3 cp "$MSI" "s3://${R2_BUCKET}/bridge-${VERSION}.msi" \
-            --endpoint-url "$R2_ENDPOINT" --content-type application/x-msi
-          aws s3 cp "$MSI" "s3://${R2_BUCKET}/bridge-latest.msi" \
-            --endpoint-url "$R2_ENDPOINT" --content-type application/x-msi
-          aws s3 cp latest.json "s3://${R2_BUCKET}/latest.json" \
-            --endpoint-url "$R2_ENDPOINT" --content-type application/json \
-            --cache-control "no-cache"
-
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -201,14 +190,14 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            assets/*.msi
+            assets/${{ env.INSTALLER_NAME }}
             assets/*.msi.sig
             latest.json
           body: |
             GourmelyPrint Bridge — local print service for GourmelyHub POS.
 
             ## Install
-            Download from the GourmelyHub dashboard (Configuración → Impresión → Instalar GourmelyPrint Bridge), or grab the `.msi` below.
+            Download from the GourmelyHub dashboard (Configuración → Impresión → Instalar GourmelyPrint Bridge). It downloads a single `${{ env.INSTALLER_NAME }}` — double-click to install.
 
             ## Auto-update
             Installed bridges check `latest.json` on boot and offer a one-click update — no reinstall needed.

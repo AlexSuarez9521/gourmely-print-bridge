@@ -53,7 +53,9 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": ["https://downloads.gourmelyhub.busticco.com/latest.json"],
+      "endpoints": [
+        "https://github.com/AlexSuarez9521/gourmely-print-bridge/releases/latest/download/latest.json"
+      ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU0QUM5NUE4MjgyQzA2NzAKUldSd0Jpd29xSldzNUlRQU5xcDF1WEVNTUJ5bmxqU09qSFNFQTMvRU0xUHlpd1VZRk9sS1hsNksK"
     }
   }

@@ -50,8 +50,10 @@ git push origin v0.1.1
 ```
 
 The `Release` workflow builds the MSI, signs it for the auto-updater,
-publishes a GitHub Release, and mirrors the artifacts to the Cloudflare
-R2 download bucket. See `.github/workflows/release.yml`.
+and publishes a GitHub Release with a stable-named installer asset
+(`GourmelyPrint-Bridge-setup.msi`). The GourmelyHub dashboard download
+button + the updater point at the permanent `/releases/latest/download/`
+URL. See `.github/workflows/release.yml`.
 
 ## License
 

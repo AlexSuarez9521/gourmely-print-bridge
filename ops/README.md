@@ -38,7 +38,8 @@ The workflow:
 
 After merging the PR, tag `v<new-version>` and push it to trigger
 `release.yml`, which builds the new MSI, signs it for the auto-updater,
-and uploads it to GitHub Releases + the Cloudflare R2 download mirror.
+and publishes it to a GitHub Release (the dashboard + updater use the
+permanent `/releases/latest/download/` URL).
 
 ### Required repo secrets
 
