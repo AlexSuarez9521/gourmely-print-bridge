@@ -1,0 +1,67 @@
+# TEMPORARY ops workflow: upsert a DNS record in the busticco.com zone using
+# the CLOUDFLARE_DNS_API_TOKEN secret (Zone:Read + DNS:Edit, zone-scoped) that
+# the cert-renew workflow already uses. Dispatched manually; removed after use.
+name: dns-upsert
+
+on:
+  workflow_dispatch:
+    inputs:
+      record_name:
+        description: "Record name (without zone), e.g. status-gourmelyhub"
+        required: true
+      record_type:
+        description: "Record type"
+        required: true
+        default: "CNAME"
+      content:
+        description: "Record content (target host or IP)"
+        required: true
+      proxied:
+        description: "Cloudflare proxy (true/false)"
+        required: true
+        default: "true"
+
+permissions: {}
+
+jobs:
+  upsert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upsert record
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_DNS_API_TOKEN }}
+          NAME: ${{ inputs.record_name }}
+          TYPE: ${{ inputs.record_type }}
+          CONTENT: ${{ inputs.content }}
+          PROXIED: ${{ inputs.proxied }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CF_TOKEN" ]; then
+            echo "::error::CLOUDFLARE_DNS_API_TOKEN secret is not set"
+            exit 1
+          fi
+          ZONE_ID=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=busticco.com" \
+            | jq -r '.result[0].id')
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "null" ]; then
+            echo "::error::Could not resolve zone id for busticco.com"
+            exit 1
+          fi
+          FQDN="$NAME.busticco.com"
+          EXISTING=$(curl -fsS -H "Authorization: Bearer $CF_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=$FQDN" \
+            | jq -r '.result[0].id // empty')
+          BODY=$(jq -n --arg type "$TYPE" --arg name "$FQDN" --arg content "$CONTENT" \
+            --argjson proxied "$PROXIED" \
+            '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: 1}')
+          if [ -n "$EXISTING" ]; then
+            curl -fsS -X PUT -H "Authorization: Bearer $CF_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$EXISTING" \
+              -d "$BODY" | jq '{success, record: .result.name}'
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+              -d "$BODY" | jq '{success, record: .result.name}'
+          fi
