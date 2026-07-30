@@ -38,7 +38,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let sep1 = PredefinedMenuItem::separator(&handle)?;
-    let open_settings = MenuItem::with_id(&handle, "open", "Abrir configuración", true, None::<&str>)?;
+    let open_settings =
+        MenuItem::with_id(&handle, "open", "Abrir configuración", true, None::<&str>)?;
     let test_print = MenuItem::with_id(&handle, "test", "Imprimir prueba", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(&handle)?;
     let quit = MenuItem::with_id(&handle, "quit", "Salir", true, None::<&str>)?;
@@ -101,4 +102,3 @@ fn spawn_test_print<R: Runtime>(app: &AppHandle<R>) {
         let _ = app.config();
     });
 }
-

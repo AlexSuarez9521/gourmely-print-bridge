@@ -168,10 +168,7 @@ async fn printers_handler() -> Response {
     }
 }
 
-async fn print_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<ServerState>,
-) -> Response {
+async fn print_ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -221,7 +218,11 @@ async fn handle_text(text: &str) -> WsResponse {
             },
             Err(e) => WsResponse::err(id, e.to_string()),
         },
-        WsRequest::Print { id, printer: name, data } => {
+        WsRequest::Print {
+            id,
+            printer: name,
+            data,
+        } => {
             // Base64 decode + length guard. We don't trust the wire.
             let bytes = match BASE64.decode(data.as_bytes()) {
                 Ok(b) => b,

@@ -48,10 +48,7 @@ fn test_print(printer_name: String) -> Result<u32, String> {
 /// Tauri command: enable or disable auto-start with Windows. Backed by
 /// the autostart plugin which writes/removes the HKCU\Run entry.
 #[tauri::command]
-async fn set_autostart(
-    app: tauri::AppHandle,
-    enabled: bool,
-) -> Result<(), String> {
+async fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
     if enabled {
