@@ -292,7 +292,7 @@ pub async fn serve(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), BridgeError> {
     axum_server::bind_rustls(addr, tls)
         .serve(build_router(state).into_make_service())
         .await
-        .map_err(|e| BridgeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| BridgeError::Io(std::io::Error::other(e)))?;
     Ok(())
 }
 
