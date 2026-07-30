@@ -1,8 +1,13 @@
-/// Build-time and runtime configuration for the print bridge.
-///
-/// V1 ships the cert paths and allowed-origins hardcoded. V1.5 will move
-/// these to a `config.toml` next to the binary so support can debug a
-/// stuck client install without rebuilding.
+//! Build-time and runtime configuration for the print bridge.
+//!
+//! The TLS material is NO LONGER hardcoded here: `tls_material::resolve` reads
+//! it from `%PROGRAMDATA%\GourmelyPrint\certs` when present and falls back to
+//! the pair embedded at compile time, so renewing the certificate no longer
+//! needs a rebuild.
+//!
+//! The origin allowlist below is still compile-time. Moving it to a
+//! `config.toml` next to the binary — so support can point one install at a
+//! staging origin without a rebuild — is the remaining half of that idea.
 
 /// The HTTPS port the bridge listens on. Matches what
 /// `apps/platform-web/lib/print-bridge.ts` connects to.

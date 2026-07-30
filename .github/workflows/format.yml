@@ -1,0 +1,58 @@
+name: Format
+
+# Runs `cargo fmt` over the repo and commits the result to the branch it was
+# dispatched on. Manual only — never on push, so it can't rewrite someone's
+# work under them.
+#
+# Why a workflow instead of "just run cargo fmt locally": maintaining this repo
+# does not require a local Rust toolchain (the MSI is built and signed in
+# `release.yml`), so whoever touches it may well not have `cargo` installed.
+# Without this, the `cargo fmt --check` gate in ci.yml would be unfixable for
+# them.
+#
+# No `npm ci` / frontend build here on purpose: rustfmt only parses source, it
+# never runs `build.rs`, so the whole Node step is dead weight.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    name: cargo fmt --all
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Run cargo fmt
+        working-directory: src-tauri
+        run: cargo fmt --all
+
+      - name: Commit if anything changed
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "already formatted — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: cargo fmt
+
+          Applied by the Format workflow. No logic changes."
+          git push
+          echo "formatting pushed to ${{ github.ref_name }}"

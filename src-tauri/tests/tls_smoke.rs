@@ -10,6 +10,7 @@
 //!   - Reads cert files from `certs/` (only present in dev)
 //!   - Binds TCP 8181 (must be free)
 //!   - Requires DNS `localhost.gourmelyhub.busticco.com → 127.0.0.1`
+//!
 //! Run explicitly with: `cargo test --test tls_smoke -- --ignored --nocapture`
 
 use std::time::Duration;
@@ -20,12 +21,13 @@ async fn tls_health_returns_200_with_real_cert() {
     // Read cert + key from disk at test time so the smoke test exercises
     // the same wire path as production (production embeds via
     // include_bytes!, tests just read from the same `certs/` folder).
-    let cert = std::fs::read("certs/fullchain.pem").expect("certs/fullchain.pem must exist for smoke test");
-    let key = std::fs::read("certs/privkey.pem").expect("certs/privkey.pem must exist for smoke test");
+    let cert = std::fs::read("certs/fullchain.pem")
+        .expect("certs/fullchain.pem must exist for smoke test");
+    let key =
+        std::fs::read("certs/privkey.pem").expect("certs/privkey.pem must exist for smoke test");
 
-    let server_task = tokio::spawn(async move {
-        print_bridge_lib::server::serve(&cert, &key).await
-    });
+    let server_task =
+        tokio::spawn(async move { print_bridge_lib::server::serve(&cert, &key).await });
 
     // Tiny pause for the listener to be ready. axum_server is fast; 1s
     // is generous but reliable on CI runners with cold caches.
