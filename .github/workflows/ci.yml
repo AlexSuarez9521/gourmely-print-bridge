@@ -62,6 +62,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-target-ci-
 
+      # tauri.conf.json, Cargo.toml and Cargo.lock must all carry the same
+      # version. They drifted before anyone noticed (lock at 0.1.1, manifests at
+      # 0.1.2) because the renewal workflow only bumped two of the three.
+      - name: Versions agree across the three files
+        run: python ops/bump-version.py --check
+
       - name: Install frontend dependencies
         run: npm ci
 
