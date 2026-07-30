@@ -25,6 +25,34 @@ The issued `fullchain.pem` + `privkey.pem` are copied into
 at compile time. Same cert ships to every customer because the domain
 only resolves to their loopback.
 
+## Renewing without a rebuild (v0.1.3+)
+
+Since v0.1.3 the bridge reads its certificate from disk when one is there, and
+only falls back to the pair compiled into the binary. **A renewal no longer
+needs a release.** On each till:
+
+```powershell
+# As administrator, on the machine running the bridge
+$dir = "$env:PROGRAMDATA\GourmelyPrint\certs"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Copy-Item fullchain.pem, privkey.pem $dir
+# Restart the bridge from the tray (Salir, then reopen) so TLS picks it up
+```
+
+Confirm which one is live — the bridge logs `TLS material resolved` with
+`source=disk` or `source=embedded` at startup, and `GET /health` still answers
+over the renewed cert.
+
+A bad file can't take printing offline: the PEM is parsed before it is trusted,
+and anything wrong (truncated, cert and key swapped, half a pair) logs and keeps
+the embedded certificate. See `src-tauri/src/tls_material.rs`.
+
+> **Keep doing the rebuild anyway, on a slower cadence.** The embedded pair is
+> what a brand-new install starts with, on a machine that has no file on disk
+> yet. If the binary is never rebuilt, a fresh install eventually ships with an
+> expired fallback — harmless while the disk copy is present, fatal on a new
+> till. Rebaking it once or twice a year is enough.
+
 ## Automated renewal (preferred)
 
 GitHub Actions runs `.github/workflows/cert-renew.yml` every 60 days.
