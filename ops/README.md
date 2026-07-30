@@ -74,7 +74,7 @@ permanent `/releases/latest/download/` URL).
 | Secret                     | Purpose                         | Scope                                                                                                                                   |
 | -------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLOUDFLARE_DNS_API_TOKEN` | DNS-01 challenge                | `Zone:Read` + `DNS:Edit` limited to the `busticco.com` zone                                                                             |
-| `CERT_RENEWAL_PR_TOKEN`    | Open the PR from the new branch | PAT or app token with `repo` scope — needed because `GITHUB_TOKEN` will not trigger downstream workflow runs from a PR opened by itself |
+| ~~`CERT_RENEWAL_PR_TOKEN`~~ | **No longer used** — removed 2026-07-30 | It was a PAT, it expired silently, and because the secret still existed the `\|\|` fallback never fired: checkout failed with `could not read Username` and the renewal never ran. The workflow now uses `GITHUB_TOKEN`, which cannot expire. The cost is that the renewal PR does not trigger `ci.yml`; dispatch it by hand on that PR if you want the check, and `release.yml` compiles everything from the tag anyway |
 
 Set these under **Settings → Secrets and variables → Actions**.
 

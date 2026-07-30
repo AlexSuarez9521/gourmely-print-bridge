@@ -49,11 +49,22 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # GITHUB_TOKEN, not a PAT. CERT_RENEWAL_PR_TOKEN expired at some point
+      # before 2026-07-30 and, because the secret still existed, the `||` never
+      # fell through: checkout died with "could not read Username for
+      # 'https://github.com'" and the renewal never even installed certbot. The
+      # job's own token cannot expire; a PAT is a credential someone has to
+      # remember to renew, which is exactly what did not happen.
+      #
+      # Accepted trade-off: a PR opened with GITHUB_TOKEN does not trigger other
+      # workflows, so ci.yml will not run on the renewal PR. That PR only changes
+      # two .pem files and the version; whoever merges it can dispatch CI by hand,
+      # and release.yml compiles everything from the tag right after.
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: main
-          token: ${{ secrets.CERT_RENEWAL_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install certbot + Cloudflare DNS plugin
         run: |
@@ -113,28 +124,20 @@ jobs:
       - name: Bump bridge patch version
         id: bump
         if: inputs.dry_run != 'true'
+        # The version lives in THREE files. This step used to bump two of them,
+        # which is how Cargo.lock ended up at 0.1.1 while both manifests said
+        # 0.1.2. It also re-serialised tauri.conf.json with `json.dumps`, whose
+        # default `ensure_ascii=True` rewrote the installer's shortDescription
+        # and copyright as — / © on every run.
+        #
+        # `ops/bump-version.py` does all three with a targeted replacement, and
+        # it is a real file so it can be run and tested outside CI — unlike
+        # inline shell, which only ever executes months later when the cert is
+        # already about to expire.
         run: |
           set -euo pipefail
-          CONF="src-tauri/tauri.conf.json"
-          CARGO="src-tauri/Cargo.toml"
-
-          OLD=$(python3 -c "import json; print(json.load(open('$CONF'))['version'])")
-          MAJOR=$(echo "$OLD" | cut -d. -f1)
-          MINOR=$(echo "$OLD" | cut -d. -f2)
-          PATCH=$(echo "$OLD" | cut -d. -f3)
-          NEW="$MAJOR.$MINOR.$((PATCH+1))"
-
-          python3 -c "import json, sys; p='$CONF'; c=json.load(open(p)); c['version']='$NEW'; open(p,'w').write(json.dumps(c, indent=2) + '\n')"
-
-          # Cargo.toml version line — only the first occurrence (under [package]).
-          awk -v new="$NEW" '
-            BEGIN { done = 0 }
-            /^\[package\]/ { in_pkg = 1 }
-            /^\[/ && !/^\[package\]/ { in_pkg = 0 }
-            in_pkg && /^version[[:space:]]*=/ && !done { print "version = \"" new "\""; done = 1; next }
-            { print }
-          ' "$CARGO" > "$CARGO.tmp" && mv "$CARGO.tmp" "$CARGO"
-
+          OLD=$(python3 ops/bump-version.py --check | grep '^tauri.conf.json:' | cut -d' ' -f2)
+          NEW=$(python3 ops/bump-version.py --patch)
           echo "old=$OLD" >> "$GITHUB_OUTPUT"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
 
@@ -142,7 +145,7 @@ jobs:
         if: inputs.dry_run != 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.CERT_RENEWAL_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           base: main
           branch: ci/cert-renewal
           delete-branch: true
