@@ -1,0 +1,84 @@
+name: CI
+
+# Until now this repo had NO check on pull requests: `release.yml` only runs on
+# a tag, so the first time anything got compiled was while cutting a release.
+# A change that failed to build was found by a broken release, and the bridge
+# ships to every till — the worst place to learn that.
+#
+# Runs on `windows-latest` because the printer module talks to the Windows print
+# spooler; on Linux it does not compile. This repo is public, so Actions minutes
+# are free and unlimited.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/target
+          key: ${{ runner.os }}-cargo-target-ci-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-ci-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `build.rs` runs `tauri_build::build()`, which resolves `frontendDist`
+      # from tauri.conf.json. Without the built frontend every cargo command
+      # below fails before it compiles a line of Rust.
+      - name: Build frontend
+        run: npm run build
+
+      - name: cargo fmt
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --all-targets

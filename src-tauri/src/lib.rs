@@ -13,6 +13,7 @@ pub mod config;
 pub mod error;
 pub mod printer;
 pub mod server;
+pub mod tls_material;
 pub mod tray;
 
 use tauri::WindowEvent;
@@ -122,13 +123,19 @@ pub fn run() {
                 tracing::error!("failed to install tray icon: {e}");
             }
 
-            // Spawn the server on Tauri's runtime so it shuts down
-            // cleanly when the app exits. Certs are embedded into the
-            // binary at compile time — no loose PEM files on disk
-            // means no permission errors and no support tickets about
-            // "I deleted that folder by mistake".
+            // Spawn the server on Tauri's runtime so it shuts down cleanly
+            // when the app exits.
+            //
+            // The certificate is resolved at startup instead of being taken
+            // straight from the embedded bytes: a renewal can now drop a new
+            // PEM pair in %PROGRAMDATA%\GourmelyPrint\certs and restart the
+            // bridge, with no rebuild and no new MSI. The embedded pair stays
+            // as the safety net — see `tls_material` for why that ordering,
+            // and for what happens when the file on disk is corrupt.
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = server::serve(CERT_PEM, KEY_PEM).await {
+                let tls = tls_material::resolve(CERT_PEM, KEY_PEM);
+                tracing::info!(source = tls.source, "TLS material resolved");
+                if let Err(e) = server::serve(&tls.cert, &tls.key).await {
                     tracing::error!("server exited: {e}");
                 }
             });
