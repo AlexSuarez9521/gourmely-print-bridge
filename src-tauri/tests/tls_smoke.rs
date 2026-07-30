@@ -10,6 +10,7 @@
 //!   - Reads cert files from `certs/` (only present in dev)
 //!   - Binds TCP 8181 (must be free)
 //!   - Requires DNS `localhost.gourmelyhub.busticco.com → 127.0.0.1`
+//!
 //! Run explicitly with: `cargo test --test tls_smoke -- --ignored --nocapture`
 
 use std::time::Duration;
