@@ -70,13 +70,27 @@ fn find_printer(name: &str) -> BridgeResult<Printer> {
         .ok_or_else(|| BridgeError::PrinterNotFound(name.to_string()))
 }
 
-/// Writes the raw ESC/POS bytes to `<dir>/<printer>-<timestamp>.escpos`.
+/// Writes the raw ESC/POS bytes to
+/// `<dir>/<printer>-<timestamp>-<pid>-<seq>.escpos`.
 ///
 /// The bytes land untouched, so the file can be piped at a real printer later
 /// (`copy /b file \\host\printer`) or read with a hex viewer to check that the
 /// cut command and the logo raster survived the round trip.
+///
+/// # Why the name carries the pid and a counter
+///
+/// The name used to be printer + milliseconds, and everything that counts
+/// duplicates counts *files*. Two bridges printing the same job react to the
+/// same socket frame and land inside the same millisecond routinely, so the
+/// second write overwrote the first and **two tickets showed up as one** — the
+/// duplicate would have been invisible to the very test written to catch it.
+/// The pid separates two processes, the counter separates two jobs in one.
 fn print_to_sink(dir: &PathBuf, printer_name: &str, bytes: &[u8]) -> BridgeResult<u32> {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     std::fs::create_dir_all(dir)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -86,7 +100,11 @@ fn print_to_sink(dir: &PathBuf, printer_name: &str, bytes: &[u8]) -> BridgeResul
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let path = dir.join(format!("{safe}-{stamp}.escpos"));
+    let path = dir.join(format!(
+        "{safe}-{stamp}-{}-{}.escpos",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&path, bytes)?;
     tracing::warn!(
         path = %path.display(),

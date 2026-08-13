@@ -52,7 +52,7 @@
 //!   (see [`crate::engineio`]) and it is the exact shape of silent failure this
 //!   whole feature exists to delete.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{SettingsStore, MAX_PRINT_BYTES};
 use crate::engineio::{self, Incoming};
+use crate::error::{BridgeError, BridgeResult};
 use crate::job_ledger::{Claim, JobLedger};
 use crate::printer;
 
@@ -82,6 +83,15 @@ const REVOKED_BACKOFF: Duration = Duration::from_secs(300);
 const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// Presence beat. The server expires presence at three minutes.
 const HELLO_EVERY: Duration = Duration::from_secs(60);
+/// How long the beat waits for the spooler to list the printers before giving
+/// up on a fresh list.
+///
+/// Enumerating printers on Windows walks the spooler, and a driver whose device
+/// is switched off — the everyday state of a thermal printer at the till — can
+/// hold that call for a long time. Ten seconds is generous for a healthy
+/// machine and far inside the server's three-minute presence window, so a wedged
+/// spooler costs an out-of-date printer list, never the station's presence.
+const PRINTER_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the namespace ack before giving up on the handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Depth of the print queue. Deep enough for the burst a reconnect replay
@@ -144,7 +154,6 @@ pub struct RelayHandle {
     /// Poked when the pairing changes, so the supervisor drops its backoff and
     /// reconnects with the new token instead of waiting it out.
     wake: Arc<Notify>,
-    running: Arc<AtomicBool>,
 }
 
 impl RelayHandle {
@@ -190,24 +199,26 @@ type Outbound = mpsc::UnboundedSender<String>;
 
 /// Starts the supervisor. Returns immediately; the loop lives for the process.
 ///
-/// Idempotent via `running`: two supervisors would put two bridges in the same
-/// room and every ticket would print twice.
+/// # What stops a second relay
+///
+/// Not this function. It used to carry a `running` flag with a comment claiming
+/// it made `spawn` idempotent — the flag was created fresh inside `spawn`, so
+/// the compare-exchange always won and it prevented exactly nothing. It read as
+/// protection against the very duplicate that shipped.
+///
+/// The guarantee lives one level down, in the exclusive lock
+/// [`JobLedger::open`] takes: whoever cannot open the ledger never connects, so
+/// the server never has two sockets for one till to push a job down. That works
+/// across processes, which no flag in this address space can.
 pub fn spawn(settings: SettingsStore) -> RelayHandle {
     let handle = RelayHandle {
         settings,
         status: Arc::new(RwLock::new(RelayStatus::default())),
         wake: Arc::new(Notify::new()),
-        running: Arc::new(AtomicBool::new(false)),
     };
 
-    if handle
-        .running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        let worker = handle.clone();
-        tokio::spawn(async move { supervise(worker).await });
-    }
+    let worker = handle.clone();
+    tokio::spawn(async move { supervise(worker).await });
     handle
 }
 
@@ -220,6 +231,19 @@ async fn supervise(handle: RelayHandle) {
         .unwrap_or_else(|| std::path::PathBuf::from("print-jobs.jsonl"));
     let ledger = match JobLedger::open(&ledger_path) {
         Ok(l) => l,
+        Err(BridgeError::AlreadyRunning(msg)) => {
+            // The whole fix, in one branch: another bridge on this machine owns
+            // the ledger, so this one must never reach the socket. Two relays
+            // authenticate with the same station token, land in the same room,
+            // and the server pushes every job down both — one order, two
+            // comandas, and nothing in the logs to say why.
+            tracing::error!(path = %ledger_path.display(), "{msg}");
+            handle.mutate(|s| {
+                s.connected = false;
+                s.last_error = Some(msg);
+            });
+            return;
+        }
         Err(e) => {
             // Without the ledger every reconnect risks reprinting. Refusing to
             // relay is the honest answer; the local path still works.
@@ -426,8 +450,9 @@ async fn run_connection(
     // frozen at connection time.
     let hello_tx = out_tx.clone();
     let hello = tokio::spawn(async move {
+        let mut printers: Vec<String> = Vec::new();
         loop {
-            let printers = printer::list().unwrap_or_default();
+            printers = printers_or_last_known(printers, PRINTER_LIST_TIMEOUT, printer::list).await;
             let frame = engineio::event_packet(
                 NAMESPACE,
                 EV_STATION_HELLO,
@@ -505,6 +530,55 @@ async fn run_connection(
     }
     let _ = writer.await;
     ended
+}
+
+/// The printer list for the next `station-hello`, without ever letting the
+/// spooler take the runtime with it.
+///
+/// # Two separate ways this used to hurt
+///
+/// The beat called `printer::list()` straight from its async task. That call is
+/// a synchronous walk of the Windows print spooler and it blocks — for seconds,
+/// on the everyday case of a till whose thermal printer is switched off. Inside
+/// an async task a blocking call does not just delay *that* task: it owns a
+/// runtime worker for the whole duration, and everything scheduled on it stops.
+/// `deliver` already knew this and used `spawn_blocking`; the beat did not.
+///
+/// So: onto a blocking thread, **and** on a clock. `spawn_blocking` alone would
+/// still leave the beat itself waiting on a spooler that never answers, and a
+/// station whose presence lapses is a station the server stops routing to — it
+/// quietly falls back to the local path. Past [`PRINTER_LIST_TIMEOUT`] the beat
+/// goes out with the last list we managed to read, which is stale at worst and
+/// almost always identical.
+async fn printers_or_last_known<F>(
+    previous: Vec<String>,
+    limit: Duration,
+    enumerate: F,
+) -> Vec<String>
+where
+    F: FnOnce() -> BridgeResult<Vec<String>> + Send + 'static,
+{
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(enumerate)).await {
+        Ok(Ok(Ok(printers))) => printers,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(err = %e, "could not list the printers for the heartbeat; beating with the last known list");
+            previous
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(err = %e, "the printer enumeration task did not finish");
+            previous
+        }
+        Err(_) => {
+            // The blocking thread is still stuck in the spooler; it will finish
+            // on its own and its result is simply dropped. Abandoning it costs
+            // one pool thread, which is cheaper than a station going offline.
+            tracing::warn!(
+                seconds = limit.as_secs(),
+                "the print spooler did not answer; beating with the last known printer list"
+            );
+            previous
+        }
+    }
 }
 
 /// Next text frame, or a description of why there is not one.
@@ -734,6 +808,76 @@ mod tests {
         .expect("parse");
         assert!(job.os_printer_name.is_none());
         assert_eq!(job.copies, 1, "copies defaults to one, never zero");
+    }
+
+    /// The bug, in the shape it has in production.
+    ///
+    /// `flavor = "current_thread"` is the point: one worker thread, so a
+    /// blocking spooler call made straight from the async task owns the only
+    /// thread there is and **nothing else on the runtime runs** — the socket
+    /// reader, the writer, the acks, all of it. Revert
+    /// `printers_or_last_known` to calling the closure inline and the ticker
+    /// below stays at zero.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_spooler_does_not_freeze_the_rest_of_the_relay() {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+
+        let printers = printers_or_last_known(Vec::new(), Duration::from_secs(5), || {
+            // A driver whose printer is switched off, in one line.
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(vec!["Caja".to_string()])
+        })
+        .await;
+        ticker.abort();
+
+        assert_eq!(printers, vec!["Caja".to_string()]);
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed > 5,
+            "the runtime was frozen while the spooler was busy: only {observed} ticks in 400 ms"
+        );
+    }
+
+    /// A spooler that never answers must cost the printer list, never the
+    /// station's presence: falling outside the server's three-minute window
+    /// makes it route the ticket down the local path instead.
+    #[tokio::test]
+    async fn a_spooler_that_never_answers_beats_with_the_last_list() {
+        let previous = vec!["Caja".to_string()];
+        let started = Instant::now();
+        let printers = printers_or_last_known(previous.clone(), Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_millis(700));
+            Ok(vec!["never arrives".to_string()])
+        })
+        .await;
+        assert_eq!(printers, previous, "the beat must keep the list it had");
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "the beat waited for the spooler instead of giving up: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An enumeration that fails outright is the same story as one that hangs.
+    #[tokio::test]
+    async fn a_failing_enumeration_keeps_the_previous_list() {
+        let previous = vec!["Caja".to_string()];
+        let printers = printers_or_last_known(previous.clone(), Duration::from_secs(5), || {
+            Err(crate::error::BridgeError::SpoolerFailed(
+                "RPC_S_SERVER_UNAVAILABLE".into(),
+            ))
+        })
+        .await;
+        assert_eq!(printers, previous);
     }
 
     #[test]

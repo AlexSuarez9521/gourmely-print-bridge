@@ -12,10 +12,15 @@
 //!   4. Both paths end in the same `printer` module, which talks to the
 //!      Windows print spooler. There is exactly one way to put ink on
 //!      paper in this program.
+//!
+//! And, before any of it: **exactly one of these processes may exist**. See
+//! [`run`] and [`instance_lock`] — two bridges on one till print every ticket
+//! twice, and the relay is what made that reachable.
 
 pub mod config;
 pub mod engineio;
 pub mod error;
+pub mod instance_lock;
 pub mod job_ledger;
 pub mod pairing;
 pub mod printer;
@@ -157,7 +162,36 @@ pub fn run() {
         env!("CARGO_PKG_VERSION")
     );
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // single-instance FIRST, before any other plugin gets to do work.
+    //
+    // A second launch of the bridge is not a cosmetic annoyance: both copies
+    // dial out to GourmelyHub with the same station token, land in the same
+    // room, and the server pushes every print job down both sockets. One order,
+    // two comandas, and nothing in the logs that says why. Before the relay the
+    // second copy was harmless only by accident — it could not take port 8181
+    // and sat there inert.
+    //
+    // The callback runs in the copy that was already running, so the second
+    // launch reads to the cashier as "the window opened", which is what they
+    // wanted when they double-clicked. Meanwhile the plugin exits the new
+    // process before it can print anything.
+    //
+    // This net does not cover a build that runs outside Tauri (a test, a
+    // support harness, `cargo run` next to an installed copy); the exclusive
+    // lock on the print ledger does, and it is the one the relay checks.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        tracing::warn!(
+            ?argv,
+            cwd,
+            "a second instance tried to start; showing the one already running instead"
+        );
+        tray::show_main_window(app);
+    }));
+
+    builder
         // opener: lets the tray menu open files / URLs without spawning shell commands.
         .plugin(tauri_plugin_opener::init())
         // autostart: HKCU\...\Run on Windows (no-op flag for macOS — not in scope yet).

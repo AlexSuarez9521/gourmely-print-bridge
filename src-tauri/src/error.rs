@@ -37,6 +37,16 @@ pub enum BridgeError {
     /// The relay could not talk to the server (network, DNS, TLS, protocol).
     #[error("relay: {0}")]
     Relay(String),
+
+    /// Another copy of the bridge already holds the print ledger.
+    ///
+    /// Its own variant rather than a `Config` string because the two need
+    /// opposite answers: a broken config file is something to fix, a second
+    /// instance is something to close — and only this one means the tickets are
+    /// about to print twice. The message is already the operator's sentence, so
+    /// `Display` passes it through untouched.
+    #[error("{0}")]
+    AlreadyRunning(String),
 }
 
 pub type BridgeResult<T> = Result<T, BridgeError>;

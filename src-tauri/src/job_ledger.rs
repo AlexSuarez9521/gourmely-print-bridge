@@ -13,6 +13,21 @@
 //! cut at the till, Windows update, someone closing it) *between* printing and
 //! recording, and a `HashSet` dies with the process. So the ledger is a file.
 //!
+//! # And a file is not enough either, if two processes share it
+//!
+//! Everything below is a `HashMap` in front of that file, and a map is private
+//! to its process. Two bridges running at once each keep their own, each sees a
+//! job neither has recorded, and **both print it** — the relay made that
+//! reachable, because an outbound socket needs no port to fight over. Worse,
+//! [`JobLedger::compact`] used to rewrite the whole file from its own map, so
+//! one process's housekeeping erased the other's idempotency records and the
+//! risk of reprinting outlived the second instance.
+//!
+//! So opening the ledger now takes an exclusive [`InstanceLock`] beside it and
+//! holds it for as long as the ledger lives. A second bridge cannot open the
+//! ledger, and the relay refuses to start without one — which is the point:
+//! it never connects, so the server never has two sockets to push to.
+//!
 //! **The job id is written BEFORE the bytes reach the spooler.** That ordering
 //! is deliberate and it is not the obvious one:
 //!
@@ -42,6 +57,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BridgeError, BridgeResult};
+use crate::instance_lock::InstanceLock;
 
 /// How long a job id is remembered.
 ///
@@ -93,6 +109,12 @@ pub enum Claim {
 
 pub struct JobLedger {
     path: PathBuf,
+    /// Cross-process exclusion, held for as long as this ledger exists.
+    ///
+    /// Nothing reads it: its whole job is to make [`JobLedger::open`] fail in a
+    /// second bridge. Every method below therefore runs under it by
+    /// construction, `compact` included — which is what makes the rewrite safe.
+    _lock: InstanceLock,
     seen: HashMap<String, Entry>,
     /// Lines currently in the file, to decide when to compact.
     lines: usize,
@@ -105,15 +127,34 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where the exclusive lock for `ledger` lives: `print-jobs.jsonl` →
+/// `print-jobs.lock`, in the same directory, so one data folder is one bridge.
+pub fn lock_path_for(ledger: &Path) -> PathBuf {
+    ledger.with_extension("lock")
+}
+
 impl JobLedger {
     /// Opens (or creates) the ledger at `path` and drops expired entries.
+    ///
+    /// Fails with [`BridgeError::AlreadyRunning`] when another bridge already
+    /// has it. That failure is not an inconvenience to work around — it is the
+    /// mechanism, and the relay is expected to give up on it.
     pub fn open(path: impl Into<PathBuf>) -> BridgeResult<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Before the first read: everything below reads the file and rewrites
+        // it, and doing either while another bridge is doing the same is how
+        // the duplicate happens.
+        let lock = InstanceLock::acquire(lock_path_for(&path))?;
         let (seen, lines) = read_all(&path)?;
-        let mut ledger = Self { path, seen, lines };
+        let mut ledger = Self {
+            path,
+            _lock: lock,
+            seen,
+            lines,
+        };
         ledger.compact()?;
         Ok(ledger)
     }
@@ -184,12 +225,42 @@ impl JobLedger {
 
     /// Rewrites the file with one line per live job, dropping anything past
     /// [`RETENTION`]. Atomic: a crash mid-compaction leaves the old file.
+    ///
+    /// # It re-reads the file; it does not dump the map
+    ///
+    /// This used to serialise `self.seen` straight over the file, which is only
+    /// correct while exactly one process owns it. It did not: two bridges
+    /// shared one `%PROGRAMDATA%`, so whichever compacted first **deleted every
+    /// job id the other had recorded** — and a deleted id is a job that reads
+    /// as `Fresh` on the next replay and prints a second time. The damage
+    /// outlived the second instance, because the file it left behind was short
+    /// a day's worth of records.
+    ///
+    /// Reading the file back and folding this process's knowledge into it can
+    /// only ever add records, never drop someone else's. Under the lock taken
+    /// in [`JobLedger::open`] there is no second writer to merge with today —
+    /// this is what keeps the outcome harmless if that ever stops being true.
     fn compact(&mut self) -> BridgeResult<()> {
+        // What is genuinely on disk, not what this process remembers writing.
+        let (mut live, _) = read_all(&self.path)?;
+
+        // Fold our own view on top. `append` writes the line before it updates
+        // the map, so in a healthy run this adds nothing; it matters when the
+        // file was replaced under us and our memory is the newer copy.
+        for (job_id, entry) in self.seen.drain() {
+            match live.get(&job_id) {
+                Some(on_disk) if !supersedes(&entry, on_disk) => {}
+                _ => {
+                    live.insert(job_id, entry);
+                }
+            }
+        }
+
         let cutoff = now_secs().saturating_sub(RETENTION.as_secs());
-        self.seen.retain(|_, e| e.at >= cutoff);
+        live.retain(|_, e| e.at >= cutoff);
 
         let mut body = String::new();
-        for entry in self.seen.values() {
+        for entry in live.values() {
             let line = serde_json::to_string(entry).map_err(|e| {
                 BridgeError::Config(format!("serializar registro de impresión: {e}"))
             })?;
@@ -204,13 +275,31 @@ impl JobLedger {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        self.lines = self.seen.len();
+        self.lines = live.len();
+        self.seen = live;
         Ok(())
     }
 
     #[cfg(test)]
     pub fn tracked(&self) -> usize {
         self.seen.len()
+    }
+}
+
+/// Which of two records for the same job is the later truth.
+///
+/// Later timestamp wins. On a tie the terminal state wins, because a claim and
+/// its outcome routinely land inside the same second (`at` is in seconds) and
+/// reading them the other way round would turn a ticket that printed into a
+/// phantom `Interrupted` — a failure reported for a job the customer is holding.
+fn supersedes(candidate: &Entry, current: &Entry) -> bool {
+    (candidate.at, finality(candidate.state)) > (current.at, finality(current.state))
+}
+
+fn finality(state: JobState) -> u8 {
+    match state {
+        JobState::Claimed => 0,
+        JobState::Printed | JobState::Failed => 1,
     }
 }
 
@@ -348,5 +437,105 @@ mod tests {
             on_disk.lines().count() <= 2,
             "file was rewritten, not grown"
         );
+    }
+
+    // ── Two bridges on one till ─────────────────────────────────────────
+
+    /// The regression the verifier reproduced, at its root.
+    ///
+    /// Before the lock this returned two working ledgers over one file, each
+    /// with its own map, and every job that reached both printed twice.
+    #[test]
+    fn a_second_bridge_cannot_open_the_same_ledger() {
+        let path = temp_path("second-bridge");
+        let first = JobLedger::open(&path).expect("the first bridge opens it");
+        match JobLedger::open(&path) {
+            Err(BridgeError::AlreadyRunning(msg)) => {
+                assert!(msg.contains("ya está abierto"), "unhelpful message: {msg}")
+            }
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(_) => panic!("two ledgers over one file — every ticket would print twice"),
+        }
+        drop(first);
+        JobLedger::open(&path).expect("and the next bridge can, once the first is gone");
+    }
+
+    /// The lock lives beside the ledger, not on it: on Windows a locked byte
+    /// range is unreadable through every other handle, so locking the ledger
+    /// itself would lock out the code that has to read it.
+    #[test]
+    fn the_ledger_stays_readable_while_it_is_locked() {
+        let path = temp_path("readable");
+        let mut ledger = JobLedger::open(&path).expect("open");
+        ledger.claim("job-r").expect("claim");
+        let raw = std::fs::read_to_string(&path).expect("the ledger must stay readable");
+        assert!(raw.contains("job-r"));
+    }
+
+    /// The medium finding: compaction used to rewrite the file from one
+    /// process's map, wiping the other's idempotency records — so a job that
+    /// had already printed came back as `Fresh` and printed again.
+    ///
+    /// Revert `compact` to serialising `self.seen` and this goes red: `other-1`
+    /// disappears from the file and the reopened ledger prints it a second time.
+    #[test]
+    fn compaction_keeps_records_it_did_not_write_itself() {
+        let path = temp_path("compact-foreign");
+        let mut ledger = JobLedger::open(&path).expect("open");
+        ledger.claim("mine-1").expect("claim");
+        ledger.finish("mine-1", true, None).expect("finish");
+
+        // A line this process never appended: what a second bridge would have
+        // left behind, or what any concurrent writer looks like from here.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        writeln!(
+            file,
+            "{{\"jobId\":\"other-1\",\"state\":\"printed\",\"at\":{}}}",
+            now_secs()
+        )
+        .expect("write foreign entry");
+        drop(file);
+
+        ledger.compact().expect("compact");
+
+        let on_disk = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            on_disk.contains("other-1"),
+            "compaction deleted a record it did not write; that job will print again:\n{on_disk}"
+        );
+        assert!(on_disk.contains("mine-1"), "and it must keep its own");
+        assert_eq!(
+            ledger.claim("other-1").expect("claim"),
+            Claim::AlreadyDone {
+                ok: true,
+                error: None
+            },
+            "the foreign record must still stop a reprint"
+        );
+    }
+
+    /// A claim and its outcome share a second often enough that the tie-break
+    /// is not theoretical: get it backwards and a printed ticket is reported as
+    /// interrupted.
+    #[test]
+    fn an_outcome_beats_a_claim_recorded_in_the_same_second() {
+        let at = now_secs();
+        let claimed = Entry {
+            job_id: "j".into(),
+            state: JobState::Claimed,
+            at,
+            error: None,
+        };
+        let printed = Entry {
+            job_id: "j".into(),
+            state: JobState::Printed,
+            at,
+            error: None,
+        };
+        assert!(supersedes(&printed, &claimed));
+        assert!(!supersedes(&claimed, &printed));
     }
 }

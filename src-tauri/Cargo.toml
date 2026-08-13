@@ -87,6 +87,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # code stays simple and cross-platform-friendly.
 printers = "2"
 
+# One bridge per machine, enforced before anything else boots.
+#
+# Until the relay, a second copy was harmless by accident: it could not take
+# port 8181 and sat there inert. An outbound socket needs no port to fight over,
+# so the second copy now authenticates with the same station token, joins the
+# same room, and the server pushes every job down both sockets — one order, two
+# comandas. The trigger is routine: the X hides the window to the tray,
+# autostart already launched one at login, and the cashier double-clicks the
+# shortcut because nothing looks open.
+#
+# This is the outer net (the second one is the ledger lock in
+# `src/instance_lock.rs`, which also covers the case where the process is not
+# running under Tauri at all). Desktop only — the plugin has no mobile
+# implementation, and `cfg(desktop)` in `lib.rs` gates the call to match.
+#
+# This header must come after every entry of `[dependencies]`: a `[target.…]`
+# table ends the one above it, so a crate added below would silently stop being
+# a dependency of every platform.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 [dev-dependencies]
 axum-test = "16"
 

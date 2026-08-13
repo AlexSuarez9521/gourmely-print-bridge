@@ -85,8 +85,19 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+/// Brings the settings window to the front, whatever state it is in.
+///
+/// `pub(crate)` because the single-instance handler in [`crate::run`] needs
+/// exactly this: when the cashier double-clicks the shortcut on a bridge that
+/// is already running, the second process dies and *this* is what they see, so
+/// the double-click still looks like it did something.
+///
+/// `unminimize` first: with close-to-tray the window is usually hidden, but it
+/// can also be minimised, and `show` on a minimised window leaves it on the
+/// taskbar — which reads as "nothing happened" and earns a second double-click.
+pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
     } else {
