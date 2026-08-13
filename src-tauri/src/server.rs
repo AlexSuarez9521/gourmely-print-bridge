@@ -10,19 +10,36 @@
 //!   - `GET  /printers`  → list of OS printer names
 //!   - `WS   /print`     → upgrade to WebSocket; expects JSON messages
 //!
-//! Origin enforcement: every request whose `Origin` header is not in
-//! `config::ALLOWED_ORIGINS` is rejected with HTTP 403 before the WS
-//! upgrade. Prevents random tabs in the cashier's Chrome from talking
-//! to the printer.
+//! # Who is allowed to print through this socket
+//!
+//! The module used to claim that "every request whose `Origin` header is not in
+//! `config::ALLOWED_ORIGINS` is rejected with HTTP 403 before the WS upgrade".
+//! **It was not.** `CorsLayer` decorates responses; it does not reject them,
+//! and a browser does not apply CORS to a WebSocket handshake in the first
+//! place. So the allowlist was documentation, the socket had no authentication
+//! of any kind, and any page open on the till could print whatever it liked.
+//!
+//! [`guard`] is that check, for real:
+//!
+//! * the `Origin` is now enforced in the handler, with an actual 403. This one
+//!   costs the POS nothing — its origin is already on the list — and a browser
+//!   cannot forge the header, which is precisely why it closes the hole.
+//! * a shared secret, presented as `?token=`, `Authorization: Bearer …` or the
+//!   `x-gourmelyprint-token` header, covers the callers that are not browsers
+//!   and can therefore say whatever they want in `Origin`.
+//!
+//! [`crate::config::LocalAuth`] decides how strictly the two combine. The
+//! default, `origin-or-secret`, is the strongest setting that does not require
+//! the web to ship first; `secret` is the end state.
 
 use std::{net::SocketAddr, time::Instant};
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
-    http::{HeaderName, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -33,7 +50,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::{
-    config::{ALLOWED_ORIGINS, BIND_PORT, MAX_PRINT_BYTES},
+    config::{LocalAuth, SettingsStore, ALLOWED_ORIGINS, BIND_PORT, MAX_PRINT_BYTES},
     error::BridgeError,
     printer,
 };
@@ -43,6 +60,96 @@ use crate::{
 pub struct ServerState {
     pub started_at: Instant,
     pub version: &'static str,
+    pub settings: SettingsStore,
+}
+
+/// `?token=…` on the upgrade URL.
+///
+/// A browser `WebSocket` constructor cannot set headers, so the query string is
+/// the only place the web can put the secret when that side ships. The other
+/// two forms exist for native callers, which can.
+#[derive(Debug, Default, Deserialize)]
+pub struct AuthQuery {
+    pub token: Option<String>,
+}
+
+/// Constant-time comparison. A local secret is not worth a timing attack over
+/// loopback, but getting this wrong by habit elsewhere is, so it is written the
+/// way credentials are always written.
+fn secret_matches(expected: &str, presented: &str) -> bool {
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(presented.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|origin| ALLOWED_ORIGINS.contains(&origin))
+        .unwrap_or(false)
+}
+
+fn presented_secret(headers: &HeaderMap, query: &AuthQuery) -> Option<String> {
+    if let Some(token) = query.token.as_deref().filter(|t| !t.is_empty()) {
+        return Some(token.to_string());
+    }
+    if let Some(value) = headers
+        .get("x-gourmelyprint-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Decides whether this caller may drive the printer. `Ok(())` or the 403 the
+/// caller gets, with a message that says which of the two doors it missed.
+pub fn guard(state: &ServerState, headers: &HeaderMap, query: &AuthQuery) -> Result<(), String> {
+    let settings = state.settings.snapshot();
+    let mode = settings.local_auth;
+    if mode == LocalAuth::Off {
+        return Ok(());
+    }
+
+    let secret_ok = match (
+        settings.local_secret.as_deref(),
+        presented_secret(headers, query),
+    ) {
+        (Some(expected), Some(presented)) => secret_matches(expected, &presented),
+        _ => false,
+    };
+    if secret_ok {
+        return Ok(());
+    }
+
+    match mode {
+        LocalAuth::Off => Ok(()),
+        LocalAuth::Secret => {
+            Err("esta impresión necesita el token local del bridge (localAuth=secret)".to_string())
+        }
+        LocalAuth::OriginOrSecret => {
+            if origin_allowed(headers) {
+                Ok(())
+            } else {
+                Err(
+                    "origen no autorizado y sin token local: esta página no puede imprimir"
+                        .to_string(),
+                )
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -168,7 +275,30 @@ async fn printers_handler() -> Response {
     }
 }
 
-async fn print_ws_handler(ws: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
+/// Note the argument order: the guard's inputs are extracted **before**
+/// `WebSocketUpgrade`. Axum runs extractors in declaration order, so with the
+/// upgrade first a caller that is not allowed here but also did not send a
+/// well-formed handshake got a 400 from the extractor and the guard never ran.
+/// The answer to "may you print?" should not depend on how well the request was
+/// formed, and a 403 is also the honest thing to log.
+async fn print_ws_handler(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(reason) = guard(&state, &headers, &query) {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("(sin origen)");
+        tracing::warn!(origin, reason, "rejected a print socket");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": reason })),
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -266,7 +396,11 @@ async fn handle_text(text: &str) -> WsResponse {
 /// the installer drops a single self-contained `.exe` — no loose `.pem`
 /// files in `C:\Program Files` and no permission errors when the
 /// installer can't reach `%PROGRAMFILES%`.
-pub async fn serve(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), BridgeError> {
+pub async fn serve(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    settings: SettingsStore,
+) -> Result<(), BridgeError> {
     // rustls 0.23 requires picking a crypto provider explicitly at process
     // startup. We pick aws-lc-rs (FIPS-able, default in rustls). Safe to
     // call multiple times — `.ok()` swallows the "already installed" err
@@ -276,7 +410,12 @@ pub async fn serve(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), BridgeError> {
     let state = ServerState {
         started_at: Instant::now(),
         version: env!("CARGO_PKG_VERSION"),
+        settings,
     };
+    tracing::info!(
+        mode = ?state.settings.snapshot().local_auth,
+        "local print socket authentication"
+    );
 
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem.to_vec(), key_pem.to_vec())
         .await
@@ -296,10 +435,168 @@ pub async fn serve(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Router with the local guard turned OFF, for the tests that are about the
+/// routes rather than about who may reach them.
 #[allow(dead_code)]
 pub fn router_for_tests() -> Router {
+    router_with_settings(crate::config::Settings {
+        local_auth: LocalAuth::Off,
+        ..Default::default()
+    })
+}
+
+/// Router wired to a specific settings snapshot, so a test can pin the auth
+/// mode and the secret without touching `%PROGRAMDATA%`.
+#[allow(dead_code)]
+pub fn router_with_settings(settings: crate::config::Settings) -> Router {
     build_router(ServerState {
         started_at: Instant::now(),
         version: "test",
+        settings: SettingsStore::in_memory(settings),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Settings;
+
+    fn headers(origin: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(o) = origin {
+            h.insert(
+                axum::http::header::ORIGIN,
+                HeaderValue::from_str(o).expect("header"),
+            );
+        }
+        h
+    }
+
+    fn state(local_auth: LocalAuth) -> ServerState {
+        ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                local_auth,
+                local_secret: Some("s3cr3t".into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The hole this change closes. Before it, this call succeeded.
+    #[test]
+    fn a_random_page_on_the_till_cannot_print() {
+        let denied = guard(
+            &state(LocalAuth::OriginOrSecret),
+            &headers(Some("https://cupones-gratis.example")),
+            &AuthQuery::default(),
+        );
+        assert!(denied.is_err());
+    }
+
+    /// The compatibility guarantee: the POS as it ships today, which sends no
+    /// token at all, must keep printing.
+    #[test]
+    fn the_pos_keeps_printing_without_changing_a_line() {
+        for origin in ALLOWED_ORIGINS {
+            assert!(
+                guard(
+                    &state(LocalAuth::OriginOrSecret),
+                    &headers(Some(origin)),
+                    &AuthQuery::default()
+                )
+                .is_ok(),
+                "{origin} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_with_no_origin_needs_the_secret() {
+        // curl, a script, anything native: it can lie about Origin, so the
+        // origin door is not open to it.
+        assert!(guard(
+            &state(LocalAuth::OriginOrSecret),
+            &headers(None),
+            &AuthQuery::default()
+        )
+        .is_err());
+        assert!(guard(
+            &state(LocalAuth::OriginOrSecret),
+            &headers(None),
+            &AuthQuery {
+                token: Some("s3cr3t".into())
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn secret_mode_ignores_the_origin() {
+        // The end state, once the web presents the token.
+        assert!(guard(
+            &state(LocalAuth::Secret),
+            &headers(Some(ALLOWED_ORIGINS[0])),
+            &AuthQuery::default()
+        )
+        .is_err());
+        assert!(guard(
+            &state(LocalAuth::Secret),
+            &headers(Some(ALLOWED_ORIGINS[0])),
+            &AuthQuery {
+                token: Some("s3cr3t".into())
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn off_is_the_old_behaviour_and_lets_everything_through() {
+        assert!(guard(
+            &state(LocalAuth::Off),
+            &headers(Some("https://cualquier-cosa.example")),
+            &AuthQuery::default()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_secret_travels_in_three_shapes() {
+        let expected = AuthQuery {
+            token: Some("s3cr3t".into()),
+        };
+        assert!(guard(&state(LocalAuth::Secret), &headers(None), &expected).is_ok());
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer s3cr3t"),
+        );
+        assert!(guard(&state(LocalAuth::Secret), &bearer, &AuthQuery::default()).is_ok());
+
+        let mut custom = HeaderMap::new();
+        custom.insert("x-gourmelyprint-token", HeaderValue::from_static("s3cr3t"));
+        assert!(guard(&state(LocalAuth::Secret), &custom, &AuthQuery::default()).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_secret_is_a_wrong_secret() {
+        assert!(guard(
+            &state(LocalAuth::Secret),
+            &headers(None),
+            &AuthQuery {
+                token: Some("s3cr3".into())
+            }
+        )
+        .is_err());
+        assert!(guard(
+            &state(LocalAuth::Secret),
+            &headers(None),
+            &AuthQuery {
+                token: Some("s3cr3tt".into())
+            }
+        )
+        .is_err());
+    }
 }

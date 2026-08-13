@@ -7,11 +7,25 @@
  * smaller when we ship a Windows installer.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 
 const APP_BOOT_AT = Date.now();
 const TICK_MS = 5_000;
+
+/** Mirror of the Rust `RelayStatus`. Never carries the station token. */
+interface RelayStatus {
+  paired: boolean;
+  connected: boolean;
+  serverUrl: string;
+  label: string | null;
+  roles: string[];
+  lastError: string | null;
+  tokenRejected: boolean;
+  jobsPrinted: number;
+  jobsFailed: number;
+}
 
 interface HealthSnapshot {
   /** Mirror of the Rust `HealthResponse`. */
@@ -23,14 +37,18 @@ interface HealthSnapshot {
 
 // ─── Tab switching ───────────────────────────────────────────────────
 
-function initTabs() {
+function showTab(target: string) {
   const tabs = document.querySelectorAll<HTMLButtonElement>('.tab');
   const panels = document.querySelectorAll<HTMLElement>('.panel');
+  tabs.forEach((t) => t.classList.toggle('is-active', t.dataset.tab === target));
+  panels.forEach((p) => p.classList.toggle('is-active', p.dataset.panel === target));
+}
+
+function initTabs() {
+  const tabs = document.querySelectorAll<HTMLButtonElement>('.tab');
   tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
-      const target = tab.dataset.tab;
-      tabs.forEach((t) => t.classList.toggle('is-active', t === tab));
-      panels.forEach((p) => p.classList.toggle('is-active', p.dataset.panel === target));
+      if (tab.dataset.tab) showTab(tab.dataset.tab);
     });
   });
 }
@@ -76,6 +94,145 @@ function formatUptime(seconds: number): string {
   if (m < 60) return `${m}m ${seconds % 60}s`;
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;
+}
+
+// ─── Estación tab (impresión remota) ─────────────────────────────────
+
+/**
+ * Paints the relay panel.
+ *
+ * The wording matters more than the layout here: whoever reads this is a
+ * cashier deciding whether to call support. "Sin conexión" and "hay que volver
+ * a vincular" are different problems with different fixes, so they never share
+ * a message.
+ */
+function renderRelay(status: RelayStatus) {
+  const state = document.getElementById('relay-state');
+  const label = document.getElementById('relay-label');
+  const printed = document.getElementById('relay-printed');
+  const failed = document.getElementById('relay-failed');
+  const error = document.getElementById('relay-error');
+  const forget = document.getElementById('pair-forget');
+  const submit = document.getElementById('pair-submit');
+  const serverInput = document.getElementById('server-url') as HTMLInputElement | null;
+
+  if (state) {
+    state.textContent = !status.paired
+      ? 'Sin vincular'
+      : status.connected
+        ? 'Conectado'
+        : status.tokenRejected
+          ? 'Rechazada'
+          : 'Reconectando…';
+  }
+  if (label) {
+    label.textContent = status.label
+      ? status.roles.length
+        ? `${status.label} (${status.roles.join(', ')})`
+        : status.label
+      : '—';
+  }
+  if (printed) printed.textContent = String(status.jobsPrinted);
+  if (failed) failed.textContent = String(status.jobsFailed);
+
+  if (error) {
+    if (status.lastError && status.paired) {
+      error.textContent = status.lastError;
+      error.hidden = false;
+    } else {
+      error.hidden = true;
+    }
+  }
+  if (forget) forget.hidden = !status.paired;
+  if (submit) submit.textContent = status.paired ? 'Vincular de nuevo' : 'Vincular estación';
+  // Only hydrate when the field is untouched, so typing is never overwritten
+  // by the 5-second refresh.
+  if (serverInput && document.activeElement !== serverInput && !serverInput.value) {
+    serverInput.value = status.serverUrl;
+  }
+}
+
+async function refreshRelay() {
+  try {
+    renderRelay(await invoke<RelayStatus>('relay_status'));
+  } catch (e) {
+    console.warn('relay_status failed', e);
+  }
+}
+
+function setRelayMessage(text: string, isError: boolean) {
+  const error = document.getElementById('relay-error');
+  if (!error) return;
+  error.textContent = text;
+  error.hidden = false;
+  error.classList.toggle('is-error', isError);
+}
+
+async function initStation() {
+  const codeInput = document.getElementById('pair-code') as HTMLInputElement | null;
+  const serverInput = document.getElementById('server-url') as HTMLInputElement | null;
+  const submit = document.getElementById('pair-submit') as HTMLButtonElement | null;
+  const forget = document.getElementById('pair-forget') as HTMLButtonElement | null;
+  const secret = document.getElementById('local-secret');
+
+  if (secret) {
+    try {
+      secret.textContent = (await invoke<string | null>('local_secret')) ?? '—';
+    } catch (e) {
+      console.warn('local_secret failed', e);
+    }
+  }
+
+  submit?.addEventListener('click', async () => {
+    const code = codeInput?.value?.trim() ?? '';
+    if (!code) {
+      setRelayMessage('Escribe el código que aparece en GourmelyHub.', true);
+      codeInput?.focus();
+      return;
+    }
+    submit.disabled = true;
+    const original = submit.textContent;
+    submit.textContent = 'Vinculando…';
+    try {
+      const status = await invoke<RelayStatus>('pair_station', {
+        code,
+        serverUrl: serverInput?.value?.trim() || null,
+      });
+      if (codeInput) codeInput.value = '';
+      renderRelay(status);
+      setRelayMessage(`Estación vinculada: ${status.label ?? 'sin nombre'}.`, false);
+    } catch (e) {
+      // The message is the server's own sentence — it is written for the
+      // person at the till, so it is shown verbatim.
+      setRelayMessage(String(e), true);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = original;
+    }
+  });
+
+  forget?.addEventListener('click', async () => {
+    forget.disabled = true;
+    try {
+      renderRelay(await invoke<RelayStatus>('unpair_station'));
+      setRelayMessage(
+        'Esta caja quedó desvinculada. Para revocar la estación del todo, hazlo también en GourmelyHub.',
+        false,
+      );
+    } catch (e) {
+      setRelayMessage(String(e), true);
+    } finally {
+      forget.disabled = false;
+    }
+  });
+
+  // The tray's "Vincular estación…" lands here.
+  void listen('open-pairing', () => {
+    showTab('station');
+    document.getElementById('pair-code')?.focus();
+  });
+
+  await refreshRelay();
 }
 
 // ─── Impresoras tab ──────────────────────────────────────────────────
@@ -224,9 +381,11 @@ function showUpdateBanner(update: Update) {
 window.addEventListener('DOMContentLoaded', () => {
   initTabs();
   initSettings();
+  void initStation();
   refreshStatus();
   refreshPrinterList();
   setInterval(refreshStatus, TICK_MS);
+  setInterval(refreshRelay, TICK_MS);
   // Best-effort update check on boot. Never blocks the UI.
   void checkForUpdate();
   console.info(`GourmelyPrint Bridge UI booted at ${new Date(APP_BOOT_AT).toISOString()}`);

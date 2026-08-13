@@ -13,7 +13,8 @@
 //! `axum-test` can talk to it directly.
 
 use axum_test::TestServer;
-use print_bridge_lib::server::router_for_tests;
+use print_bridge_lib::config::{LocalAuth, Settings};
+use print_bridge_lib::server::{router_for_tests, router_with_settings};
 use serde_json::Value;
 
 #[tokio::test]
@@ -40,4 +41,100 @@ async fn printers_returns_array_of_names() {
     let body: Value = res.json();
     assert_eq!(body["ok"], true);
     assert!(body["printers"].is_array());
+}
+
+/// The local auth hole, exercised over a REAL socket.
+///
+/// It has to be a real one. `axum-test` drives the router through a mock
+/// transport that never carries hyper's upgrade state, so `WebSocketUpgrade`
+/// rejects with 426 before the handler body runs and every case looks the same
+/// — a test that would have "passed" while testing nothing. Binding an
+/// ephemeral port and doing an actual handshake is the only way to see the
+/// guard's answer.
+///
+/// Both halves matter and neither alone is enough: a 403 for everyone would
+/// "close the hole" by breaking printing at the till.
+mod local_auth {
+    use super::*;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    /// Boots the guarded router on an ephemeral port. Returns its address; the
+    /// server task lives as long as the test.
+    async fn guarded_server() -> String {
+        let router = router_with_settings(Settings {
+            local_auth: LocalAuth::OriginOrSecret,
+            local_secret: Some("el-secreto-local".into()),
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Attempts the handshake and reports the HTTP status the bridge answered:
+    /// 101 when it let the caller in, 403 when the guard turned it away.
+    async fn handshake(base: &str, path: &str, origin: Option<&str>) -> u16 {
+        let mut request = format!("{base}{path}")
+            .into_client_request()
+            .expect("build request");
+        if let Some(origin) = origin {
+            request.headers_mut().insert(
+                "origin",
+                HeaderValue::from_str(origin).expect("origin header"),
+            );
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((_stream, response)) => response.status().as_u16(),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            Err(e) => panic!("handshake failed for an unexpected reason: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_that_is_not_the_pos_cannot_print() {
+        let base = guarded_server().await;
+        assert_eq!(
+            handshake(&base, "/print", Some("https://cupones-gratis.example")).await,
+            403,
+            "any page open on the till could print"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pos_is_not_broken_by_the_guard() {
+        let base = guarded_server().await;
+        assert_eq!(
+            handshake(
+                &base,
+                "/print",
+                Some("https://app-gourmelyhub.busticco.com")
+            )
+            .await,
+            101,
+            "the POS as it ships today, which sends no token, must keep printing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_native_caller_needs_the_secret_and_needs_it_right() {
+        let base = guarded_server().await;
+        // No Origin at all: curl, a script, another program on the machine.
+        assert_eq!(
+            handshake(&base, "/print?token=el-secreto-local", None).await,
+            101
+        );
+        assert_eq!(
+            handshake(&base, "/print?token=casi-el-secreto", None).await,
+            403
+        );
+        assert_eq!(handshake(&base, "/print", None).await, 403);
+    }
 }

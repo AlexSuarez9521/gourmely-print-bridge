@@ -8,6 +8,7 @@
 //! Menu:
 //!   • GourmelyPrint Bridge                   (header, disabled — branding)
 //!   • Abrir configuración                    (opens main window)
+//!   • Vincular estación…                     (opens the pairing panel)
 //!   • Imprimir prueba                        (sends a test ticket to the default printer)
 //!   • Salir                                  (quits the process)
 //!
@@ -16,12 +17,21 @@
 //! window, not the tray, so the menu has no stale "iniciando…" label.
 //! "Ver logs" and "Acerca de" were removed: logs aren't written in V1
 //! and "Acerca de" linked to GitHub, which customers shouldn't see.
+//!
+//! "Vincular estación…" is the one addition, and it earns the slot: pairing is
+//! the single thing someone has to do on a brand-new till, and the person doing
+//! it is a cashier, not an engineer. It must be reachable from the icon by the
+//! clock without knowing that a settings window exists — and it must never
+//! involve editing a file by hand.
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, Runtime,
+    AppHandle, Emitter, Manager, Runtime,
 };
+
+/// Event the settings UI listens for to jump straight to the pairing panel.
+pub const OPEN_PAIRING_EVENT: &str = "open-pairing";
 
 /// Installs the tray icon on the running Tauri app. Call once at
 /// startup from `lib.rs` inside `setup`.
@@ -40,13 +50,22 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let sep1 = PredefinedMenuItem::separator(&handle)?;
     let open_settings =
         MenuItem::with_id(&handle, "open", "Abrir configuración", true, None::<&str>)?;
+    let pair = MenuItem::with_id(&handle, "pair", "Vincular estación…", true, None::<&str>)?;
     let test_print = MenuItem::with_id(&handle, "test", "Imprimir prueba", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(&handle)?;
     let quit = MenuItem::with_id(&handle, "quit", "Salir", true, None::<&str>)?;
 
     let menu = Menu::with_items(
         &handle,
-        &[&header, &sep1, &open_settings, &test_print, &sep2, &quit],
+        &[
+            &header,
+            &sep1,
+            &open_settings,
+            &pair,
+            &test_print,
+            &sep2,
+            &quit,
+        ],
     )?;
 
     TrayIconBuilder::with_id("main")
@@ -56,6 +75,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => show_main_window(app),
+            "pair" => open_pairing(app),
             "test" => spawn_test_print(app),
             "quit" => app.exit(0),
             _ => {}
@@ -71,6 +91,18 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = win.set_focus();
     } else {
         tracing::warn!("main window not found when trying to show");
+    }
+}
+
+/// Opens the window and tells the UI to land on the pairing panel.
+///
+/// The event is emitted after `show`, and the UI also checks a flag on boot:
+/// the window may still be building its DOM when this fires, and a pairing
+/// screen that only appears sometimes is worse than one more click.
+fn open_pairing<R: Runtime>(app: &AppHandle<R>) {
+    show_main_window(app);
+    if let Err(e) = app.emit(OPEN_PAIRING_EVENT, ()) {
+        tracing::warn!("could not ask the UI to open the pairing panel: {e}");
     }
 }
 
