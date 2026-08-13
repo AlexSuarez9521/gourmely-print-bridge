@@ -25,8 +25,9 @@
 //!
 //! So opening the ledger now takes an exclusive [`InstanceLock`] beside it and
 //! holds it for as long as the ledger lives. A second bridge cannot open the
-//! ledger, and the relay refuses to start without one — which is the point:
-//! it never connects, so the server never has two sockets to push to.
+//! ledger, and the relay will not connect without one — which is the point:
+//! the server never has two sockets to push to. It keeps asking for it, so the
+//! copy that lost comes back by itself once the other is closed.
 //!
 //! **The job id is written BEFORE the bytes reach the spooler.** That ordering
 //! is deliberate and it is not the obvious one:
@@ -70,6 +71,16 @@ const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// Compact once the file passes this many lines. A busy till writes two lines
 /// per ticket, so this is roughly a thousand tickets.
 const COMPACT_AT_ENTRIES: usize = 2_000;
+
+/// After a compaction fails, how many more lines to accept before trying
+/// again.
+///
+/// Without it a till whose disk is full retries a full read-and-rewrite of an
+/// ever-growing file on *every* ticket, which is the worst moment to add I/O.
+/// Roughly a hundred tickets is often enough to pick the disk back up soon
+/// after somebody clears it, and rare enough to cost nothing while it is
+/// broken.
+const COMPACT_RETRY_AFTER: usize = 200;
 
 /// What the bridge knows about one job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +129,11 @@ pub struct JobLedger {
     seen: HashMap<String, Entry>,
     /// Lines currently in the file, to decide when to compact.
     lines: usize,
+    /// Line count past which the next compaction is attempted. Normally
+    /// [`COMPACT_AT_ENTRIES`]; pushed out by [`COMPACT_RETRY_AFTER`] each time
+    /// one fails, so a broken disk is retried periodically instead of on every
+    /// single ticket.
+    compact_at: usize,
 }
 
 fn now_secs() -> u64 {
@@ -138,7 +154,11 @@ impl JobLedger {
     ///
     /// Fails with [`BridgeError::AlreadyRunning`] when another bridge already
     /// has it. That failure is not an inconvenience to work around — it is the
-    /// mechanism, and the relay is expected to give up on it.
+    /// mechanism, and the relay is expected to stand down on it.
+    ///
+    /// Stand down, not stop: `relay::acquire_ledger` retries and says so in the
+    /// UI, because the other copy can be closed and a bridge that gave up for
+    /// good was a till that never printed again.
     pub fn open(path: impl Into<PathBuf>) -> BridgeResult<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -154,8 +174,15 @@ impl JobLedger {
             _lock: lock,
             seen,
             lines,
+            compact_at: COMPACT_AT_ENTRIES,
         };
-        ledger.compact()?;
+        // Best effort, deliberately. `read_all` above is what this ledger
+        // actually needs to be correct; compaction only evicts expired entries
+        // and shrinks the file. Refusing to open over a failed *housekeeping*
+        // step would hand a full disk the power to stop the till printing
+        // altogether — and the entries it failed to evict make old jobs read as
+        // `AlreadyDone` rather than `Fresh`, which is the safe direction.
+        ledger.compact_best_effort();
         Ok(ledger)
     }
 
@@ -215,12 +242,39 @@ impl JobLedger {
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
 
+        // From here the claim is durable and known. Nothing below may turn
+        // this call into an error: `print_worker` reads an `Err` from `claim`
+        // as "I could not record it, so I must not print it", and refusing to
+        // print a job that *is* recorded costs the till a ticket for no safety
+        // in return.
         self.lines += 1;
         self.seen.insert(entry.job_id.clone(), entry);
-        if self.lines > COMPACT_AT_ENTRIES {
-            self.compact()?;
+        if self.lines > self.compact_at {
+            self.compact_best_effort();
         }
         Ok(())
+    }
+
+    /// Compacts, and treats failure as what it is: housekeeping that did not
+    /// happen.
+    ///
+    /// The file stays as it was, the map stays as it was (see [`Self::compact`]
+    /// for why that second half is not free), and the only lasting effect is a
+    /// ledger longer than we would like. The alternative — propagating — turns
+    /// a full disk into a till that stops printing, which is a far worse
+    /// failure than a log file that keeps growing.
+    fn compact_best_effort(&mut self) {
+        if let Err(e) = self.compact() {
+            self.compact_at = self.lines.saturating_add(COMPACT_RETRY_AFTER);
+            tracing::error!(
+                err = %e,
+                path = %self.path.display(),
+                lines = self.lines,
+                retry_at = self.compact_at,
+                "could not compact the print ledger; keeping the existing file and \
+                 the idempotency records in memory, printing continues"
+            );
+        }
     }
 
     /// Rewrites the file with one line per live job, dropping anything past
@@ -240,6 +294,30 @@ impl JobLedger {
     /// only ever add records, never drop someone else's. Under the lock taken
     /// in [`JobLedger::open`] there is no second writer to merge with today —
     /// this is what keeps the outcome harmless if that ever stops being true.
+    ///
+    /// # Nothing in memory is given up until the new file is in place
+    ///
+    /// This is the other half of the same rule, and it is the one that was
+    /// missing. Compaction used to start by *draining* `self.seen` into the
+    /// merged map — that is, it emptied the idempotency table **before**
+    /// serialising, creating the temp file, writing it, fsyncing it and
+    /// renaming it. Any of those five can fail, and the one that fails in real
+    /// life is precisely the write: the till's disk is full. On that path
+    /// `compact` returned `Err` with the map empty, because the only line that
+    /// refills it (`self.seen = live`) sits at the very end of the happy path.
+    ///
+    /// The blast radius is a reprint, which is the one outcome this module
+    /// exists to prevent. An emptied map answers the next [`JobLedger::claim`]
+    /// with [`Claim::Fresh`] for a job it printed minutes ago, and the server
+    /// replays exactly those jobs on the next reconnect. It is not a rare
+    /// corner either: `append` calls this every time the file passes
+    /// [`COMPACT_AT_ENTRIES`], i.e. in the middle of an ordinary busy service.
+    ///
+    /// So the merge now reads `self.seen` instead of draining it, and the two
+    /// fields are reassigned only once every fallible step is behind us. A
+    /// failed compaction is then exactly what it should be: housekeeping that
+    /// did not happen, on a file that is still the old good one, with the
+    /// process's memory of what it printed fully intact.
     fn compact(&mut self) -> BridgeResult<()> {
         // What is genuinely on disk, not what this process remembers writing.
         let (mut live, _) = read_all(&self.path)?;
@@ -247,11 +325,13 @@ impl JobLedger {
         // Fold our own view on top. `append` writes the line before it updates
         // the map, so in a healthy run this adds nothing; it matters when the
         // file was replaced under us and our memory is the newer copy.
-        for (job_id, entry) in self.seen.drain() {
-            match live.get(&job_id) {
-                Some(on_disk) if !supersedes(&entry, on_disk) => {}
+        //
+        // By reference: `self.seen` has to survive everything below failing.
+        for (job_id, entry) in &self.seen {
+            match live.get(job_id) {
+                Some(on_disk) if !supersedes(entry, on_disk) => {}
                 _ => {
-                    live.insert(job_id, entry);
+                    live.insert(job_id.clone(), entry.clone());
                 }
             }
         }
@@ -268,15 +348,13 @@ impl JobLedger {
             body.push('\n');
         }
 
-        let tmp = self.path.with_extension("jsonl.tmp");
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(body.as_bytes())?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, &self.path)?;
+        replace_file(&self.path, &self.path.with_extension("jsonl.tmp"), &body)?;
+
+        // Past this point nothing can fail, so the map can safely become the
+        // file. Never move any of these above the write.
         self.lines = live.len();
         self.seen = live;
+        self.compact_at = COMPACT_AT_ENTRIES;
         Ok(())
     }
 
@@ -284,6 +362,34 @@ impl JobLedger {
     pub fn tracked(&self) -> usize {
         self.seen.len()
     }
+}
+
+/// Writes `body` over `path` through `tmp`, so the ledger is either the old
+/// file or the new one and never a half of either.
+///
+/// The temp file is removed when any step fails. Leaving it behind would be
+/// mostly cosmetic — the name is fixed, so the next attempt truncates it — but
+/// "mostly" is doing real work there: on a disk that filled up, the leftover is
+/// occupying the very space the retry needs.
+fn replace_file(path: &Path, tmp: &Path, body: &str) -> BridgeResult<()> {
+    let written = (|| -> BridgeResult<()> {
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(body.as_bytes())?;
+        // Durability before visibility: renaming a file whose bytes are still
+        // in the OS cache can leave an empty ledger after a power cut, which
+        // reads as "nothing was ever printed".
+        file.sync_all()?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(tmp);
+        return written;
+    }
+    if let Err(e) = std::fs::rename(tmp, path) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Which of two records for the same job is the later truth.
@@ -515,6 +621,174 @@ mod tests {
             },
             "the foreign record must still stop a reprint"
         );
+    }
+
+    // ── When compaction cannot write ────────────────────────────────────
+    //
+    // The rewrite is five fallible steps (serialise, create, write, fsync,
+    // rename) and the one that fails at a till is the write: the disk is full.
+    // Compaction used to `drain` the idempotency map into its merged copy
+    // *before* all five, and only put it back on the happy path — so a failed
+    // write left the process with an EMPTY table of what it had printed. Every
+    // job the server replays after that reads as `Fresh` and prints a second
+    // time.
+    //
+    // Both tests below break a real filesystem operation rather than injecting
+    // a fake error, so they exercise the same `?` the disk would.
+
+    /// Makes `File::create(tmp)` fail for real, by putting a directory where
+    /// the temp file has to go. Fails on the FIRST write step — the earliest
+    /// point at which the old code had already emptied the map.
+    fn block_the_temp_file(ledger_path: &Path) -> PathBuf {
+        let tmp = ledger_path.with_extension("jsonl.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::create_dir_all(&tmp).expect("a directory where the temp file goes");
+        tmp
+    }
+
+    /// A ticket that already printed must not print again because the disk was
+    /// full when the ledger tried to tidy itself up.
+    #[test]
+    fn a_failed_compaction_keeps_the_idempotency_it_had() {
+        let path = temp_path("compact-fails");
+        let mut ledger = JobLedger::open(&path).expect("open");
+        ledger.claim("job-printed").expect("claim");
+        ledger.finish("job-printed", true, None).expect("finish");
+        ledger.claim("job-failed").expect("claim");
+        ledger
+            .finish("job-failed", false, Some("sin papel".into()))
+            .expect("finish");
+        let before = ledger.tracked();
+        assert_eq!(before, 2, "both jobs are known before the disk breaks");
+
+        block_the_temp_file(&path);
+        let err = ledger
+            .compact()
+            .expect_err("compaction must fail when it cannot create its temp file");
+        println!("[p1] compaction failed as intended: {err}");
+
+        // The whole point: the map is untouched, so the replay is answered
+        // from memory instead of reprinting.
+        assert_eq!(
+            ledger.tracked(),
+            before,
+            "compaction emptied the idempotency map on the way out; every replayed job reprints"
+        );
+        assert_eq!(
+            ledger.claim("job-printed").expect("claim"),
+            Claim::AlreadyDone {
+                ok: true,
+                error: None
+            },
+            "the ticket would have come out of the printer a SECOND time"
+        );
+        assert_eq!(
+            ledger.claim("job-failed").expect("claim"),
+            Claim::AlreadyDone {
+                ok: false,
+                error: Some("sin papel".into())
+            },
+        );
+
+        // And the file it refused to replace is still the good one.
+        let on_disk = std::fs::read_to_string(&path).expect("the old ledger must still be there");
+        assert!(on_disk.contains("job-printed"), "on disk:\n{on_disk}");
+        assert!(on_disk.contains("job-failed"), "on disk:\n{on_disk}");
+    }
+
+    /// The same guarantee when the failure lands as LATE as it can: the temp
+    /// file is fully written and fsynced, and the rename is what fails.
+    ///
+    /// Windows only, because that is where the mechanism exists:
+    /// `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)` refuses to replace a
+    /// destination carrying the read-only attribute, while POSIX `rename`
+    /// cares about the directory's permissions instead. The bridge ships on
+    /// Windows, so this is the platform whose late failure matters.
+    #[cfg(windows)]
+    #[test]
+    fn idempotency_survives_a_failure_at_the_very_last_step() {
+        let path = temp_path("compact-rename-fails");
+        let mut ledger = JobLedger::open(&path).expect("open");
+        ledger.claim("job-late").expect("claim");
+        ledger.finish("job-late", true, None).expect("finish");
+
+        // Read-only destination: create/write/fsync all succeed, rename does not.
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("make the ledger read-only");
+
+        let err = ledger
+            .compact()
+            .expect_err("renaming over a read-only file must fail on Windows");
+        println!("[p1] compaction failed at the rename: {err}");
+
+        assert_eq!(
+            ledger.claim("job-late").expect("claim"),
+            Claim::AlreadyDone {
+                ok: true,
+                error: None
+            },
+            "a failure at the last step still cost the map, so the ticket reprints"
+        );
+
+        // The temp file must not be left behind occupying the space the retry
+        // needs.
+        let tmp = path.with_extension("jsonl.tmp");
+        assert!(
+            !tmp.exists(),
+            "the abandoned temp file was left on a disk that is probably full: {}",
+            tmp.display()
+        );
+
+        // Clearing the attribute is the whole point here, and this is the
+        // Windows-only arm of the test: the lint warns about `false` meaning
+        // "world-writable" on Unix, which this never compiles as.
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).expect("restore");
+    }
+
+    /// The production shape of the same bug: nobody calls `compact` by hand.
+    /// `append` calls it once the file passes [`COMPACT_AT_ENTRIES`], which is
+    /// an ordinary busy evening, and the very next job is the one that
+    /// reprints.
+    #[test]
+    fn a_compaction_that_fails_mid_service_neither_reprints_nor_stops_printing() {
+        let path = temp_path("compact-mid-service");
+        let mut ledger = JobLedger::open(&path).expect("open");
+
+        // The evening's tickets, up to the line that triggers housekeeping.
+        for i in 0..COMPACT_AT_ENTRIES / 2 {
+            let id = format!("ticket-{i}");
+            assert_eq!(ledger.claim(&id).expect("claim"), Claim::Fresh);
+            ledger.finish(&id, true, None).expect("finish");
+        }
+        assert!(ledger.lines > COMPACT_AT_ENTRIES / 2, "the file grew");
+
+        // The disk gives out exactly as the ledger decides to tidy up.
+        block_the_temp_file(&path);
+        let id = format!("ticket-{}", COMPACT_AT_ENTRIES / 2);
+        assert_eq!(
+            ledger.claim(&id).expect("a claim must not fail over housekeeping"),
+            Claim::Fresh,
+            "the till stopped printing because a log file could not be shrunk"
+        );
+        ledger.finish(&id, true, None).expect("finish");
+
+        // The server reconnects and replays the evening. Not one of them may
+        // print again.
+        for i in 0..=COMPACT_AT_ENTRIES / 2 {
+            let id = format!("ticket-{i}");
+            assert_eq!(
+                ledger.claim(&id).expect("claim"),
+                Claim::AlreadyDone {
+                    ok: true,
+                    error: None
+                },
+                "{id} was replayed and would have printed a second time"
+            );
+        }
     }
 
     /// A claim and its outcome share a second often enough that the tie-break

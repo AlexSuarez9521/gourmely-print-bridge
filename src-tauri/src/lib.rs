@@ -42,6 +42,10 @@ use tauri_plugin_autostart::MacosLauncher;
 const CERT_PEM: &[u8] = include_bytes!("../certs/fullchain.pem");
 const KEY_PEM: &[u8] = include_bytes!("../certs/privkey.pem");
 
+/// How often the tray tooltip is compared against the relay's state. Only a
+/// change writes anything, so this is a cheap read of an `RwLock`.
+const TRAY_TOOLTIP_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Tauri command: returns the list of printers registered on this
 /// machine. Exposed both to the WSS clients (via `server::handle`) and
 /// to the Tauri webview UI (settings page can show what's available).
@@ -274,6 +278,27 @@ pub fn run() {
             } else {
                 tracing::info!("relay: no station paired yet — pair from Ajustes → Estación");
             }
+
+            // Keep the tray tooltip honest about the relay.
+            //
+            // The icon by the clock is all most tills ever show, and a bridge
+            // that has stood down — because a second copy holds the print
+            // ledger — looks exactly like one that is printing. Someone has to
+            // be able to find that out without opening a window.
+            let tray_app = app.handle().clone();
+            let watched = relay.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut shown: Option<String> = None;
+                loop {
+                    let tip = tray::tooltip_for(&watched.status());
+                    if shown.as_deref() != Some(tip.as_str()) {
+                        tray::set_tooltip(&tray_app, &tip);
+                        shown = Some(tip);
+                    }
+                    tokio::time::sleep(TRAY_TOOLTIP_TICK).await;
+                }
+            });
+
             app.manage(relay);
 
             // Spawn the server on Tauri's runtime so it shuts down cleanly

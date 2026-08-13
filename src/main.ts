@@ -23,6 +23,12 @@ interface RelayStatus {
   roles: string[];
   lastError: string | null;
   tokenRejected: boolean;
+  /**
+   * Another copy of the bridge on this machine holds the print ledger, so this
+   * one has stood down and is waiting for it. Not a connection fault: the fix
+   * is closing the other copy, not checking the internet.
+   */
+  blockedByAnotherInstance: boolean;
   jobsPrinted: number;
   jobsFailed: number;
 }
@@ -117,13 +123,20 @@ function renderRelay(status: RelayStatus) {
   const serverInput = document.getElementById('server-url') as HTMLInputElement | null;
 
   if (state) {
-    state.textContent = !status.paired
-      ? 'Sin vincular'
-      : status.connected
-        ? 'Conectado'
-        : status.tokenRejected
-          ? 'Rechazada'
-          : 'Reconectando…';
+    // "En espera" comes first, and before the paired check, because it is true
+    // regardless of pairing and it is the only one of these the cashier can fix
+    // from where they are standing. Calling it "Reconectando…" — which is what
+    // this used to show — points them at the internet for a problem that is a
+    // second bridge open on their own desktop.
+    state.textContent = status.blockedByAnotherInstance
+      ? 'En espera'
+      : !status.paired
+        ? 'Sin vincular'
+        : status.connected
+          ? 'Conectado'
+          : status.tokenRejected
+            ? 'Rechazada'
+            : 'Reconectando…';
   }
   if (label) {
     label.textContent = status.label
@@ -136,9 +149,13 @@ function renderRelay(status: RelayStatus) {
   if (failed) failed.textContent = String(status.jobsFailed);
 
   if (error) {
-    if (status.lastError && status.paired) {
+    // A bridge that has stood down must explain itself even when it was never
+    // paired: it is the copy that will not print, and the sentence names the
+    // process to close.
+    if (status.lastError && (status.paired || status.blockedByAnotherInstance)) {
       error.textContent = status.lastError;
       error.hidden = false;
+      error.classList.toggle('is-error', status.blockedByAnotherInstance);
     } else {
       error.hidden = true;
     }

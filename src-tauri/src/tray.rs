@@ -30,8 +30,13 @@ use tauri::{
     AppHandle, Emitter, Manager, Runtime,
 };
 
+use crate::relay::RelayStatus;
+
 /// Event the settings UI listens for to jump straight to the pairing panel.
 pub const OPEN_PAIRING_EVENT: &str = "open-pairing";
+
+/// Id of the tray icon, needed to reach it again after `install`.
+const TRAY_ID: &str = "main";
 
 /// Installs the tray icon on the running Tauri app. Call once at
 /// startup from `lib.rs` inside `setup`.
@@ -68,7 +73,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         ],
     )?;
 
-    TrayIconBuilder::with_id("main")
+    TrayIconBuilder::with_id(TRAY_ID)
         .tooltip("GourmelyPrint Bridge")
         .icon(app.default_window_icon().unwrap().clone())
         .menu(&menu)
@@ -83,6 +88,50 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .build(app)?;
 
     Ok(())
+}
+
+/// The tooltip that goes under the mouse when someone hovers the tray icon.
+///
+/// # Why this is worth its lines
+///
+/// The tray icon is the only part of the bridge most tills ever show, and it
+/// looks identical whether the relay is printing or has stood down because a
+/// second copy holds the print ledger. That second state is the dangerous one:
+/// a live process, a normal-looking icon, and not one ticket for the rest of
+/// the day. Naming it on hover is the cheapest place to break that symmetry —
+/// it costs no window, no click and no notification.
+///
+/// A pure function of the status so it can be tested without a desktop.
+pub fn tooltip_for(status: &RelayStatus) -> String {
+    let line = if status.blocked_by_another_instance {
+        "EN ESPERA — ya hay otro GourmelyPrint abierto; esta copia no imprime".to_string()
+    } else if !status.paired {
+        "Sin vincular — abre Ajustes → Estación".to_string()
+    } else if status.token_rejected {
+        "Estación rechazada — vuelve a vincularla".to_string()
+    } else if status.connected {
+        match status.label.as_deref() {
+            Some(label) => format!("Conectado — {label}"),
+            None => "Conectado".to_string(),
+        }
+    } else {
+        "Reconectando…".to_string()
+    };
+    format!("GourmelyPrint Bridge\n{line}")
+}
+
+/// Pushes a new tooltip onto the installed tray icon.
+///
+/// Best effort: a tooltip that fails to update is not worth a log line at
+/// error, and there is nothing the bridge could do about it anyway.
+pub fn set_tooltip<R: Runtime>(app: &AppHandle<R>, text: &str) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        tracing::debug!("no tray icon to update the tooltip on");
+        return;
+    };
+    if let Err(e) = tray.set_tooltip(Some(text)) {
+        tracing::debug!(err = %e, "could not update the tray tooltip");
+    }
 }
 
 /// Brings the settings window to the front, whatever state it is in.
@@ -144,4 +193,81 @@ fn spawn_test_print<R: Runtime>(app: &AppHandle<R>) {
         // about unused move).
         let _ = app.config();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn standing_down() -> RelayStatus {
+        RelayStatus {
+            paired: true,
+            connected: false,
+            blocked_by_another_instance: true,
+            last_error: Some("GourmelyPrint Bridge ya está abierto en este equipo".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The tooltip has to distinguish the two states that look identical from
+    /// outside: a bridge that is printing, and one that has stood down for
+    /// another copy and never will.
+    #[test]
+    fn a_bridge_that_stood_down_does_not_look_healthy_on_hover() {
+        let tip = tooltip_for(&standing_down());
+        assert!(tip.contains("EN ESPERA"), "{tip}");
+        assert!(tip.contains("no imprime"), "{tip}");
+
+        let working = RelayStatus {
+            paired: true,
+            connected: true,
+            label: Some("Caja Principal".into()),
+            ..Default::default()
+        };
+        assert!(tooltip_for(&working).contains("Conectado — Caja Principal"));
+        assert_ne!(tooltip_for(&standing_down()), tooltip_for(&working));
+    }
+
+    /// Standing down is not the same problem as a revoked token or a dead
+    /// network, and each sends support somewhere different.
+    #[test]
+    fn every_state_gets_its_own_sentence() {
+        let unpaired = RelayStatus::default();
+        let rejected = RelayStatus {
+            paired: true,
+            token_rejected: true,
+            ..Default::default()
+        };
+        let offline = RelayStatus {
+            paired: true,
+            ..Default::default()
+        };
+        let tips = [
+            tooltip_for(&unpaired),
+            tooltip_for(&rejected),
+            tooltip_for(&offline),
+            tooltip_for(&standing_down()),
+        ];
+        for (i, a) in tips.iter().enumerate() {
+            for b in tips.iter().skip(i + 1) {
+                assert_ne!(a, b, "two states share a tooltip");
+            }
+        }
+        assert!(tips[0].contains("Sin vincular"));
+        assert!(tips[1].contains("rechazada"));
+        assert!(tips[2].contains("Reconectando"));
+    }
+
+    /// A bridge that lost the ledger before it was ever paired still has to
+    /// explain itself — "Sin vincular" would send someone off to pair a copy
+    /// that is not going to print regardless.
+    #[test]
+    fn standing_down_outranks_not_being_paired() {
+        let never_paired = RelayStatus {
+            paired: false,
+            blocked_by_another_instance: true,
+            ..Default::default()
+        };
+        assert!(tooltip_for(&never_paired).contains("EN ESPERA"));
+    }
 }

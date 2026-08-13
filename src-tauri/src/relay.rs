@@ -52,6 +52,7 @@
 //!   (see [`crate::engineio`]) and it is the exact shape of silent failure this
 //!   whole feature exists to delete.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
@@ -79,6 +80,17 @@ const BASE_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Applied when the server says the token is invalid or revoked.
 const REVOKED_BACKOFF: Duration = Duration::from_secs(300);
+/// Cap on the wait between attempts to take the print ledger.
+///
+/// Shorter than [`MAX_BACKOFF`] because of who is waiting: taking the ledger
+/// fails when another copy of the bridge holds it, and the fix is somebody at
+/// the till closing that copy and then standing there watching for printing to
+/// come back. Fifteen seconds is the longest that should take.
+const LEDGER_RETRY_MAX: Duration = Duration::from_secs(15);
+/// How many ledger attempts between the reminders in the log. At the cap above
+/// this is roughly one every five minutes — enough for a support log to show
+/// the condition lasted, without a line every fifteen seconds all night.
+const LEDGER_LOG_EVERY: u32 = 20;
 /// How long a connection must hold before the backoff resets.
 const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// Presence beat. The server expires presence at three minutes.
@@ -142,6 +154,15 @@ pub struct RelayStatus {
     /// True when the server rejected the token. The UI turns this into
     /// "vuelve a vincular la estación" instead of a generic "sin conexión".
     pub token_rejected: bool,
+    /// True while another copy of the bridge on this machine holds the print
+    /// ledger, so this one is deliberately standing down.
+    ///
+    /// Its own flag rather than a shade of `connected`, because the two need
+    /// opposite reactions and only one of them is a fault. "Reconectando…" tells
+    /// the cashier to check the internet; this state is about a second bridge on
+    /// their own desktop and the fix is to close it. Showing them the wrong one
+    /// sends support after a network problem that does not exist.
+    pub blocked_by_another_instance: bool,
     pub jobs_printed: u64,
     pub jobs_failed: u64,
 }
@@ -185,6 +206,68 @@ impl RelayHandle {
     }
 }
 
+/// The printer list the presence beat announces, and the cache behind it.
+///
+/// # Why the cache is here and not in the beat task
+///
+/// `printers_or_last_known` falls back to "the last list we managed to read"
+/// when the spooler does not answer inside [`PRINTER_LIST_TIMEOUT`], and a
+/// thermal printer switched off — the everyday state of a till — is exactly
+/// what makes the spooler not answer. That fallback only means anything if the
+/// last known list survives.
+///
+/// It did not. The `Vec` holding it was declared **inside** the `station-hello`
+/// task, and `run_connection` builds that task afresh for every connection. So
+/// every reconnect reset "last known" to empty, and the first hello after a
+/// dropped socket announced `printers: []` on a till whose spooler was slow —
+/// telling the server this station has no printers at all. A reconnect is not
+/// an exotic event; it is what happens after every router reboot and every
+/// night the shop's internet drops.
+///
+/// Owning it here, in a value `supervise` keeps for the life of the process,
+/// is what makes the cache outlive the socket.
+///
+/// The enumerator is a field for the same reason it is a parameter of
+/// `printers_or_last_known`: a test needs a spooler it can wedge on demand, and
+/// the real one walks the machine's actual print queues.
+#[derive(Clone)]
+struct PrinterBeat {
+    last_known: Arc<StdMutex<Vec<String>>>,
+    enumerate: Arc<dyn Fn() -> BridgeResult<Vec<String>> + Send + Sync>,
+    limit: Duration,
+}
+
+impl PrinterBeat {
+    fn new(enumerate: impl Fn() -> BridgeResult<Vec<String>> + Send + Sync + 'static) -> Self {
+        Self {
+            last_known: Arc::new(StdMutex::new(Vec::new())),
+            enumerate: Arc::new(enumerate),
+            limit: PRINTER_LIST_TIMEOUT,
+        }
+    }
+
+    /// The last list read successfully, empty only before the first one.
+    fn snapshot(&self) -> Vec<String> {
+        match self.last_known.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Re-reads the printers for the next `station-hello`, remembering the
+    /// answer. Returns the cached list when the spooler does not produce one.
+    async fn refresh(&self) -> Vec<String> {
+        let enumerate = Arc::clone(&self.enumerate);
+        let current =
+            printers_or_last_known(self.snapshot(), self.limit, move || enumerate()).await;
+        match self.last_known.lock() {
+            Ok(mut guard) => *guard = current.clone(),
+            Err(poisoned) => *poisoned.into_inner() = current.clone(),
+        }
+        current
+    }
+}
+
 /// Why a connection attempt ended. The distinction drives the backoff.
 #[derive(Debug)]
 enum Ended {
@@ -210,7 +293,25 @@ type Outbound = mpsc::UnboundedSender<String>;
 /// [`JobLedger::open`] takes: whoever cannot open the ledger never connects, so
 /// the server never has two sockets for one till to push a job down. That works
 /// across processes, which no flag in this address space can.
+///
+/// "Never connects" is for as long as the other copy is there — not for ever.
+/// See [`acquire_ledger`]: the loser waits and keeps asking, so closing the
+/// duplicate brings this one back with no restart. Standing down permanently
+/// was its own outage.
 pub fn spawn(settings: SettingsStore) -> RelayHandle {
+    let ledger_path = crate::config::data_dir()
+        .map(|d| d.join("print-jobs.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("print-jobs.jsonl"));
+    spawn_with(settings, ledger_path, PrinterBeat::new(printer::list))
+}
+
+/// [`spawn`] with the two things a test needs to control: where the ledger
+/// lives and what enumerating the printers does.
+///
+/// Taking the path as an argument rather than reading `data_dir()` inside the
+/// supervisor also removes a process-global from the hot path — two supervisors
+/// in one test binary no longer have to agree on an environment variable.
+fn spawn_with(settings: SettingsStore, ledger_path: PathBuf, printers: PrinterBeat) -> RelayHandle {
     let handle = RelayHandle {
         settings,
         status: Arc::new(RwLock::new(RelayStatus::default())),
@@ -218,46 +319,18 @@ pub fn spawn(settings: SettingsStore) -> RelayHandle {
     };
 
     let worker = handle.clone();
-    tokio::spawn(async move { supervise(worker).await });
+    tokio::spawn(async move { supervise(worker, ledger_path, printers).await });
     handle
 }
 
 /// The forever loop.
-async fn supervise(handle: RelayHandle) {
+async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterBeat) {
     // One ledger and one print worker for the life of the process, not per
     // connection: the whole point of the ledger is to outlive the socket.
-    let ledger_path = crate::config::data_dir()
-        .map(|d| d.join("print-jobs.jsonl"))
-        .unwrap_or_else(|| std::path::PathBuf::from("print-jobs.jsonl"));
-    let ledger = match JobLedger::open(&ledger_path) {
-        Ok(l) => l,
-        Err(BridgeError::AlreadyRunning(msg)) => {
-            // The whole fix, in one branch: another bridge on this machine owns
-            // the ledger, so this one must never reach the socket. Two relays
-            // authenticate with the same station token, land in the same room,
-            // and the server pushes every job down both — one order, two
-            // comandas, and nothing in the logs to say why.
-            tracing::error!(path = %ledger_path.display(), "{msg}");
-            handle.mutate(|s| {
-                s.connected = false;
-                s.last_error = Some(msg);
-            });
-            return;
-        }
-        Err(e) => {
-            // Without the ledger every reconnect risks reprinting. Refusing to
-            // relay is the honest answer; the local path still works.
-            tracing::error!(err = %e, path = %ledger_path.display(),
-                "cannot open the print ledger; the relay will not start");
-            handle.mutate(|s| {
-                s.last_error = Some(format!(
-                    "No se puede escribir el registro de impresiones en {}: {e}",
-                    ledger_path.display()
-                ))
-            });
-            return;
-        }
-    };
+    //
+    // This blocks the relay until the ledger is ours — see `acquire_ledger` for
+    // why it waits rather than giving up.
+    let ledger = acquire_ledger(&handle, &ledger_path).await;
 
     let outbound: Arc<StdMutex<Option<Outbound>>> = Arc::new(StdMutex::new(None));
     let (tx, rx) = mpsc::channel::<PrintJob>(PRINT_QUEUE_DEPTH);
@@ -283,7 +356,7 @@ async fn supervise(handle: RelayHandle) {
         tracing::info!(url = %url, "relay connecting");
 
         let started = Instant::now();
-        let ended = run_connection(&handle, &url, &token, &tx, &outbound).await;
+        let ended = run_connection(&handle, &url, &token, &tx, &outbound, &printers).await;
         let held = started.elapsed();
 
         if let Ok(mut guard) = outbound.lock() {
@@ -328,13 +401,110 @@ async fn supervise(handle: RelayHandle) {
     }
 }
 
+/// Takes the print ledger, waiting for as long as that takes.
+///
+/// # Why it waits instead of standing down for good
+///
+/// Failing to take the ledger means another copy of the bridge holds it, and
+/// this one must not connect: two relays authenticate with the same station
+/// token, land in the same room, and the server pushes every job down both —
+/// one order, two comandas, and nothing in the logs to say why. That part was
+/// right and has not changed. **Returning** was the mistake.
+///
+/// The supervisor used to end here. Nothing restarted it, and
+/// [`RelayHandle::reconnect`] only pokes a `Notify` that no longer has a
+/// listener — so re-pairing from Ajustes did not revive it either. What that
+/// leaves is the worst shape a bridge can have: a live process with its tray
+/// icon and its settings window, both working, that will never print again for
+/// as long as the till stays on. Nobody finds out until a customer asks for
+/// their receipt.
+///
+/// And it is reachable. `tauri-plugin-single-instance` only kills the second
+/// copy when `FindWindowW` locates the first one's window; a copy started
+/// before that window exists, under a different user, or outside Tauri
+/// altogether, survives — loses the lock — and used to die here in silence.
+///
+/// So: keep retrying, because the other copy can be closed and this one should
+/// come back on its own when it is; and keep saying so, because a bridge that
+/// is standing down looks exactly like a healthy one from the outside. The
+/// wait is interruptible by [`RelayHandle::reconnect`], so pairing does not
+/// have to sit through it.
+///
+/// Both failure kinds retry. A refused lock is the one this exists for, but an
+/// I/O error is no better an argument for giving up permanently: a data folder
+/// that was briefly unreadable — antivirus, a network profile, a disk that
+/// filled up and got cleared — must not cost the till its remote printing until
+/// somebody thinks to restart the app.
+async fn acquire_ledger(handle: &RelayHandle, path: &Path) -> JobLedger {
+    let mut attempt: u32 = 0;
+    loop {
+        match JobLedger::open(path) {
+            Ok(ledger) => {
+                if attempt > 0 {
+                    tracing::info!(path = %path.display(), attempt,
+                        "the print ledger is free; the relay is starting");
+                }
+                handle.mutate(|s| {
+                    s.blocked_by_another_instance = false;
+                    // Only clear a message this loop is responsible for.
+                    if attempt > 0 {
+                        s.last_error = None;
+                    }
+                });
+                return ledger;
+            }
+            Err(BridgeError::AlreadyRunning(msg)) => {
+                // The operator-facing sentence is already inside the error —
+                // it names the process and says what to close.
+                if attempt.is_multiple_of(LEDGER_LOG_EVERY) {
+                    tracing::error!(path = %path.display(), attempt, "{msg}");
+                }
+                handle.mutate(|s| {
+                    s.connected = false;
+                    s.blocked_by_another_instance = true;
+                    s.last_error = Some(msg);
+                });
+            }
+            Err(e) => {
+                if attempt.is_multiple_of(LEDGER_LOG_EVERY) {
+                    tracing::error!(err = %e, path = %path.display(), attempt,
+                        "cannot open the print ledger; the relay is waiting for it");
+                }
+                handle.mutate(|s| {
+                    s.connected = false;
+                    s.blocked_by_another_instance = false;
+                    s.last_error = Some(format!(
+                        "No se puede escribir el registro de impresiones en {}: {e}. \
+                         El bridge lo seguirá intentando.",
+                        path.display()
+                    ));
+                });
+            }
+        }
+
+        let delay = backoff_to(attempt, LEDGER_RETRY_MAX);
+        attempt = attempt.saturating_add(1);
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = handle.wake.notified() => {}
+        }
+    }
+}
+
 /// `BASE_BACKOFF * 2^attempt`, capped, plus up to 20% jitter so a shop with
 /// several tills does not reconnect them all on the same tick.
 fn backoff(attempt: u32) -> Duration {
+    backoff_to(attempt, MAX_BACKOFF)
+}
+
+/// [`backoff`] against an explicit ceiling, because the two things this
+/// supervisor waits for deserve different ones: a server that is down, and a
+/// second copy of the bridge somebody is about to close.
+fn backoff_to(attempt: u32, cap: Duration) -> Duration {
     let exp = BASE_BACKOFF
         .checked_mul(1u32 << attempt.min(6))
-        .unwrap_or(MAX_BACKOFF)
-        .min(MAX_BACKOFF);
+        .unwrap_or(cap)
+        .min(cap);
     let jitter_ms = (exp.as_millis() as u64 / 5).max(1);
     exp + Duration::from_millis(spread(jitter_ms))
 }
@@ -359,6 +529,7 @@ async fn run_connection(
     token: &str,
     jobs: &mpsc::Sender<PrintJob>,
     outbound: &Arc<StdMutex<Option<Outbound>>>,
+    printers: &PrinterBeat,
 ) -> Ended {
     let (stream, _response) = match tokio_tungstenite::connect_async(url).await {
         Ok(pair) => pair,
@@ -448,11 +619,16 @@ async fn run_connection(
     // Presence, starting immediately: the server only routes to a station it
     // has seen inside the window, and the connect alone leaves `last_seen_at`
     // frozen at connection time.
+    //
+    // The printer list comes from `PrinterBeat`, which `supervise` owns: this
+    // task is rebuilt on every connection, and the cache behind "last known
+    // list" has to survive that or the first hello after any reconnect
+    // announces no printers at all.
     let hello_tx = out_tx.clone();
+    let hello_printers = printers.clone();
     let hello = tokio::spawn(async move {
-        let mut printers: Vec<String> = Vec::new();
         loop {
-            printers = printers_or_last_known(printers, PRINTER_LIST_TIMEOUT, printer::list).await;
+            let printers = hello_printers.refresh().await;
             let frame = engineio::event_packet(
                 NAMESPACE,
                 EV_STATION_HELLO,
@@ -759,6 +935,53 @@ fn ack(outbound: &Arc<StdMutex<Option<Outbound>>>, job_id: &str, ok: bool, error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Settings;
+    use std::net::SocketAddr;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gmly-relay-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    async fn wait_for(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A `PrinterBeat` wired to a spooler the test drives, on a short clock.
+    fn beat_with(
+        limit: Duration,
+        enumerate: impl Fn() -> BridgeResult<Vec<String>> + Send + Sync + 'static,
+    ) -> PrinterBeat {
+        PrinterBeat {
+            last_known: Arc::new(StdMutex::new(Vec::new())),
+            enumerate: Arc::new(enumerate),
+            limit,
+        }
+    }
+
+    /// A spooler that answers the first call and then wedges forever — a
+    /// thermal printer switched off after the first beat, which is the ordinary
+    /// end of a shift.
+    fn answers_once_then_hangs() -> impl Fn() -> BridgeResult<Vec<String>> + Send + Sync + 'static {
+        let calls = Arc::new(AtomicU64::new(0));
+        move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec!["Caja".to_string()])
+            } else {
+                std::thread::sleep(Duration::from_secs(3));
+                Ok(vec!["arrived far too late".to_string()])
+            }
+        }
+    }
 
     #[test]
     fn backoff_grows_and_is_capped() {
@@ -891,5 +1114,270 @@ mod tests {
             frame,
             r#"42/print,["print-result",{"error":null,"jobId":"j1","ok":true}]"#
         );
+    }
+
+    // ── The printer list across a reconnection (P3) ──────────────────────
+
+    /// The cache has to outlive the beat task, because `run_connection` builds
+    /// a new one for every connection.
+    ///
+    /// Move `last_known` back inside the task — the shape this had before — and
+    /// the second call below starts from an empty list and returns one.
+    #[tokio::test]
+    async fn the_last_known_printer_list_survives_a_new_beat_task() {
+        let beat = beat_with(Duration::from_millis(150), answers_once_then_hangs());
+
+        assert_eq!(
+            beat.refresh().await,
+            vec!["Caja".to_string()],
+            "the first beat reads the spooler"
+        );
+        // The socket dropped and `run_connection` spawned a brand-new hello
+        // task. The spooler is wedged now, so the fallback is all there is.
+        assert_eq!(
+            beat.refresh().await,
+            vec!["Caja".to_string()],
+            "the reconnect wiped the last known list; this station now reports no printers"
+        );
+        assert_eq!(beat.snapshot(), vec!["Caja".to_string()]);
+    }
+
+    /// Captures the `station-hello` of every connection, and hangs up on the
+    /// first one so the relay has to come back.
+    struct HelloSpy {
+        addr: SocketAddr,
+        hellos: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    impl HelloSpy {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind the hello spy");
+            let addr = listener.local_addr().expect("local addr");
+            let hellos = Arc::new(StdMutex::new(Vec::new()));
+
+            let captured = hellos.clone();
+            tokio::spawn(async move {
+                let mut connection = 0usize;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let captured = captured.clone();
+                    connection += 1;
+                    // Hang up on the first connection only: the second has to
+                    // stay open long enough to be read.
+                    let hang_up = connection == 1;
+                    tokio::spawn(async move { Self::serve(stream, captured, hang_up).await });
+                }
+            });
+            Self { addr, hellos }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn hellos(&self) -> Vec<serde_json::Value> {
+            match self.hellos.lock() {
+                Ok(g) => g.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+
+        async fn serve(
+            stream: tokio::net::TcpStream,
+            hellos: Arc<StdMutex<Vec<serde_json::Value>>>,
+            hang_up: bool,
+        ) {
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut sink, mut source) = ws.split();
+            // A long ping interval: heartbeats are not what this test watches.
+            if sink
+                .send(Message::text(
+                    r#"0{"sid":"spy","upgrades":[],"pingInterval":300000,"pingTimeout":200000,"maxPayload":1000000}"#,
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(Ok(msg)) = source.next().await {
+                let Message::Text(text) = msg else { continue };
+                let text = text.to_string();
+                if text.starts_with("40/print,") {
+                    if sink
+                        .send(Message::text(r#"40/print,{"sid":"spy-print"}"#))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if text.contains("\"station-hello\"") {
+                    if let Some((_, body)) = text.split_once(',') {
+                        if let Ok(serde_json::Value::Array(mut args)) =
+                            serde_json::from_str::<serde_json::Value>(body)
+                        {
+                            if args.len() == 2 {
+                                let payload = args.remove(1);
+                                match hellos.lock() {
+                                    Ok(mut g) => g.push(payload),
+                                    Err(poisoned) => poisoned.into_inner().push(payload),
+                                }
+                            }
+                        }
+                    }
+                    if hang_up {
+                        // The router rebooted.
+                        let _ = sink.close().await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The whole of P3, through the real wiring: connect, beat, lose the
+    /// socket, come back — and the station must still announce the printer it
+    /// found the first time, even though the spooler has gone quiet since.
+    ///
+    /// This is the one that would have caught it. The unit test above proves
+    /// the cache remembers; only this proves `run_connection` is holding the
+    /// cache that remembers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_station_hello_keeps_announcing_printers_after_a_reconnect() {
+        let spy = HelloSpy::start().await;
+        let ledger = temp_dir("hello-reconnect").join("print-jobs.jsonl");
+
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some(spy.url()),
+            station_token: Some("station-token-under-test".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings,
+            ledger,
+            beat_with(Duration::from_millis(150), answers_once_then_hangs()),
+        );
+
+        let two = wait_for(Duration::from_secs(20), || spy.hellos().len() >= 2).await;
+        let hellos = spy.hellos();
+        println!("[p3] hellos captured: {hellos:#?}");
+        assert!(
+            two,
+            "the relay never reconnected after the hang-up: {:?} / {:?}",
+            handle.status(),
+            hellos
+        );
+
+        assert_eq!(
+            hellos[0]["printers"],
+            json!(["Caja"]),
+            "the first connection did not read the spooler at all"
+        );
+        assert_eq!(
+            hellos[1]["printers"],
+            json!(["Caja"]),
+            "after reconnecting, the station told the server it has NO printers — \
+             the server stops routing tickets to a station with an empty list"
+        );
+    }
+
+    // ── Standing down for another bridge (P2) ────────────────────────────
+
+    /// A relay that cannot take the ledger must not connect, must say so, and
+    /// must keep trying — the three things the old `return` gave up on.
+    ///
+    /// The recovery half (the other copy closes and this one comes back by
+    /// itself) needs a socket to prove, so it lives in
+    /// `tests/standby_recovery.rs`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bridge_that_cannot_take_the_ledger_says_so_and_keeps_trying() {
+        let dir = temp_dir("standby");
+        let ledger = dir.join("print-jobs.jsonl");
+
+        // The bridge that got there first.
+        let held = crate::instance_lock::InstanceLock::acquire(
+            crate::job_ledger::lock_path_for(&ledger),
+        )
+        .expect("the first bridge takes the lock");
+
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some("http://127.0.0.1:1".into()),
+            station_token: Some("station-token-under-test".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings,
+            ledger,
+            beat_with(Duration::from_secs(1), || Ok(vec!["Caja".into()])),
+        );
+
+        let noticed = wait_for(Duration::from_secs(10), || {
+            handle.status().blocked_by_another_instance
+        })
+        .await;
+        let status = handle.status();
+        println!("[p2] standby status: {status:?}");
+        assert!(
+            noticed,
+            "the bridge stood down without telling anyone: {status:?}"
+        );
+        assert!(!status.connected, "it connected anyway");
+        assert!(
+            !status.token_rejected,
+            "this is not a token problem and must not be shown as one"
+        );
+        let reason = status.last_error.clone().unwrap_or_default();
+        assert!(
+            reason.contains("ya está abierto"),
+            "the message must name what to close: {reason:?}"
+        );
+
+        // Still alive, and the only honest way to ask.
+        //
+        // A flag that stays set proves nothing — a supervisor that returned
+        // leaves it set too, which is exactly how this state fools everyone
+        // looking at it. So: let go of the lock and watch whether anything
+        // picks it up. Nothing nudges the relay here; if it needs one it is not
+        // fixed.
+        drop(held);
+        let took_it = wait_for(Duration::from_secs(30), || {
+            !handle.status().blocked_by_another_instance
+        })
+        .await;
+        assert!(
+            took_it,
+            "nothing took the ledger after it was freed: the supervisor is gone, and this \
+             bridge will not print again until the process is restarted — {:?}",
+            handle.status()
+        );
+
+        // Terminal check: it is not merely reporting recovery, it is holding
+        // the lock. A third claim on it has to be refused.
+        assert!(
+            matches!(
+                crate::instance_lock::InstanceLock::acquire(crate::job_ledger::lock_path_for(
+                    &dir.join("print-jobs.jsonl")
+                )),
+                Err(BridgeError::AlreadyRunning(_))
+            ),
+            "the relay cleared its standby flag without actually taking the ledger"
+        );
+    }
+
+    #[test]
+    fn the_ledger_wait_is_capped_shorter_than_the_network_one() {
+        // Somebody is standing at the till waiting for this one.
+        for attempt in [0u32, 3, 6, 50, 1000] {
+            assert!(
+                backoff_to(attempt, LEDGER_RETRY_MAX) <= LEDGER_RETRY_MAX + LEDGER_RETRY_MAX / 5,
+                "attempt {attempt} blew past the ledger cap"
+            );
+        }
+        assert!(LEDGER_RETRY_MAX < MAX_BACKOFF);
+        // And the network backoff is unchanged by the refactor.
+        assert!(backoff(0) >= BASE_BACKOFF);
+        assert!(backoff(10) <= MAX_BACKOFF + MAX_BACKOFF / 5);
     }
 }
