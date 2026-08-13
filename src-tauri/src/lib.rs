@@ -245,7 +245,30 @@ pub fn run() {
             // Outbound relay. Started even when the bridge is not paired yet:
             // it parks itself and wakes up the moment a code is redeemed, so
             // pairing needs no restart at the till.
-            let relay = relay::spawn(settings.clone());
+            //
+            // # Why the runtime is entered by hand
+            //
+            // `relay::spawn` starts its supervisor with `tokio::spawn`, and
+            // **this hook does not run inside the async runtime** — Tauri calls
+            // `setup` from `Builder::build`, on the main thread. Without the
+            // guard below that call panics with *"there is no reactor running"*
+            // and takes the whole app down before the window ever appears.
+            //
+            // It is not a hypothetical: the app on `feat/relay` exited 101 on
+            // every launch, verified on a build of a47a19c itself. The feature
+            // had only ever been exercised from `#[tokio::test]`, where a
+            // runtime is already entered, so the relay tests were all green
+            // while the shipping binary could not start.
+            //
+            // Entering the handle rather than switching to
+            // `tauri::async_runtime::spawn` keeps `relay` free of any Tauri
+            // dependency, which is what lets the integration tests drive the
+            // same code with no desktop app around it.
+            let runtime = tauri::async_runtime::handle();
+            let relay = {
+                let _entered = runtime.inner().enter();
+                relay::spawn(settings.clone())
+            };
             if settings.snapshot().is_paired() {
                 tracing::info!("relay: station already paired, connecting");
             } else {

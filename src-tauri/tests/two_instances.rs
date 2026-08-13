@@ -227,49 +227,33 @@ async fn two_bridges_on_one_till_print_one_ticket() {
     let hub = FakeHub::start().await;
     println!("[two] fake hub on {}", hub.addr);
 
-    // ── The double click ────────────────────────────────────────────────
+    // ── The bridge that was already running ─────────────────────────────
+    // Staggered, not simultaneous, because that is the case that happens: the
+    // autostart entry launched one at login and the till has been printing on
+    // it all morning.
     let first = relay::spawn(paired_station(&hub.url()));
+    let up = {
+        let first = first.clone();
+        wait_for(Duration::from_secs(20), move || first.status().connected).await
+    };
+    assert!(up, "the first bridge never connected: {:?}", first.status());
+    println!("[two] first bridge connected: {:?}", first.status());
+
+    // ── The cashier double-clicks the shortcut ──────────────────────────
     let second = relay::spawn(paired_station(&hub.url()));
 
-    // ── Exactly one of them may reach the socket ────────────────────────
-    let settled = {
-        let (a, b) = (first.clone(), second.clone());
-        wait_for(Duration::from_secs(20), move || {
-            a.status().connected != b.status().connected
-        })
-        .await
-    };
-    assert!(
-        settled,
-        "neither relay settled: first={:?} second={:?}",
-        first.status(),
-        second.status()
-    );
+    // Long enough for a second socket to reach the room if it is going to.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Give the loser room to be wrong, if it is going to be.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let (winner, loser) = if first.status().connected {
-        (first.status(), second.status())
-    } else {
-        (second.status(), first.status())
-    };
-    println!("[two] connected: {winner:?}");
-    println!("[two] stood down: {loser:?}");
-
-    assert!(!loser.connected, "the second bridge connected anyway");
-    let reason = loser.last_error.unwrap_or_default();
-    assert!(
-        reason.contains("ya está abierto"),
-        "the second bridge must say why it stood down, in words the till can act on: {reason:?}"
-    );
-    assert_eq!(
-        hub.in_room(),
-        1,
-        "the server has two sockets for one till; every job it routes will print twice"
-    );
+    let (winner, loser) = (first.status(), second.status());
+    println!("[two] still connected: {winner:?}");
+    println!("[two] second launch:   {loser:?}");
 
     // ── One job ─────────────────────────────────────────────────────────
+    // Pushed to whoever is in the room, exactly as the server does. How many
+    // are in there is the whole question, so it is not asserted first: the
+    // count of tickets below is the answer the restaurant cares about, and it
+    // is the assertion that should name the failure.
     let pushed = hub.push_job("job-under-test");
     println!("[two] pushed one print-job to {pushed} socket(s) in the room");
 
@@ -322,18 +306,33 @@ async fn two_bridges_on_one_till_print_one_ticket() {
     assert_eq!(acks[0]["jobId"], "job-under-test");
     assert_eq!(acks[0]["ok"], true);
 
+    // ── Why there was only one ──────────────────────────────────────────
+    // The diagnosis, after the symptom. If the count above is right for the
+    // wrong reason — say the second bridge connected but its ledger happened
+    // to answer from cache — these are what say so.
+    assert_eq!(
+        hub.in_room(),
+        1,
+        "the server has {} sockets for one till; every job it routes goes down all of them",
+        hub.in_room()
+    );
+    assert!(!loser.connected, "the second bridge connected anyway");
+    let reason = loser.last_error.clone().unwrap_or_default();
+    assert!(
+        reason.contains("ya está abierto"),
+        "the second bridge must say why it stood down, in words the till can act on: {reason:?}"
+    );
+
     // ── And the survivor is not crippled ────────────────────────────────
     // Standing down must not cost the till its printing: the bridge that won
     // the lock keeps working, presence and all.
+    assert!(winner.connected, "the working bridge was knocked off");
     assert!(
         hub.hellos.load(Ordering::SeqCst) >= 1,
         "the connected bridge never sent presence; the server would route around it"
     );
-    let after = if first.status().connected {
-        first.status()
-    } else {
-        second.status()
-    };
+    let after = first.status();
     assert_eq!(after.jobs_printed, 1);
     assert_eq!(after.jobs_failed, 0);
+    assert_eq!(second.status().jobs_printed, 0);
 }
