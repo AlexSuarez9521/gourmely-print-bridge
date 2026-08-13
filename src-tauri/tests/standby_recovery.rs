@@ -194,8 +194,8 @@ async fn a_bridge_that_lost_the_ledger_stands_down_and_recovers_by_itself() {
     // ── The bridge that got there first ──────────────────────────────────
     // Only its lock, which is the whole of what it does to this one.
     let ledger_path = data_dir.join("print-jobs.jsonl");
-    let other_bridge =
-        InstanceLock::acquire(lock_path_for(&ledger_path)).expect("the other bridge takes the lock");
+    let other_bridge = InstanceLock::acquire(lock_path_for(&ledger_path))
+        .expect("the other bridge takes the lock");
     println!("[standby] another bridge holds {}", ledger_path.display());
 
     let bridge = relay::spawn(SettingsStore::in_memory(Settings {
@@ -219,7 +219,10 @@ async fn a_bridge_that_lost_the_ledger_stands_down_and_recovers_by_itself() {
         stood_down,
         "the bridge never reported standing down: {status:?}"
     );
-    assert!(!status.connected, "it connected while another copy had the ledger");
+    assert!(
+        !status.connected,
+        "it connected while another copy had the ledger"
+    );
     assert_eq!(
         hub.in_room(),
         0,
@@ -266,13 +269,20 @@ async fn a_bridge_that_lost_the_ledger_stands_down_and_recovers_by_itself() {
         !status.blocked_by_another_instance,
         "it connected but still reports standing down"
     );
-    assert_eq!(hub.in_room(), 1, "it is not in the room the server pushes to");
+    assert_eq!(
+        hub.in_room(),
+        1,
+        "it is not in the room the server pushes to"
+    );
 
     let pushed = hub.push_job("job-after-recovery");
     println!("[standby] pushed a job to {pushed} socket(s)");
     let printed = {
         let sink = sink_dir.clone();
-        wait_for(Duration::from_secs(20), move || !tickets_in(&sink).is_empty()).await
+        wait_for(Duration::from_secs(20), move || {
+            !tickets_in(&sink).is_empty()
+        })
+        .await
     };
     let tickets = tickets_in(&sink_dir);
     assert!(

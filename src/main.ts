@@ -14,8 +14,40 @@ import { relaunch } from '@tauri-apps/plugin-process';
 const APP_BOOT_AT = Date.now();
 const TICK_MS = 5_000;
 
+/**
+ * Mirror of the Rust `RelayState`. Kept in step by
+ * `src-tauri/tests/status_shape.rs`, which fails the build if the relay learns
+ * a state this file has no label for.
+ */
+type RelayStateName =
+  | 'unpaired'
+  | 'connecting'
+  | 'connected'
+  | 'rejected'
+  | 'standby'
+  | 'ledger-unavailable';
+
+/**
+ * What the panel calls each state.
+ *
+ * These used to be derived from three booleans, and anything without a boolean
+ * of its own fell through to "Reconectando…" — so a bridge whose print ledger
+ * could not be opened showed the wording for a dead internet link, and whoever
+ * read it went to look at the router instead of at this machine.
+ */
+const RELAY_STATE_LABEL: Record<RelayStateName, string> = {
+  unpaired: 'Sin vincular',
+  connecting: 'Reconectando…',
+  connected: 'Conectado',
+  rejected: 'Rechazada',
+  standby: 'En espera',
+  'ledger-unavailable': 'No puede imprimir',
+};
+
 /** Mirror of the Rust `RelayStatus`. Never carries the station token. */
 interface RelayStatus {
+  /** The single source of truth; the booleans below are derived from it. */
+  state: RelayStateName;
   paired: boolean;
   connected: boolean;
   serverUrl: string;
@@ -29,6 +61,11 @@ interface RelayStatus {
    * is closing the other copy, not checking the internet.
    */
   blockedByAnotherInstance: boolean;
+  /**
+   * The print ledger only opened because damage was worked around. The bridge
+   * is printing; the warning is that a recent ticket may come out twice.
+   */
+  ledgerRecovered: string | null;
   jobsPrinted: number;
   jobsFailed: number;
 }
@@ -39,6 +76,12 @@ interface HealthSnapshot {
   version: string;
   uptime_seconds: number;
   printer_count: number;
+  relay?: {
+    state: RelayStateName | 'unknown';
+    ok: boolean;
+    needs_attention: boolean;
+    detail: string;
+  };
 }
 
 // ─── Tab switching ───────────────────────────────────────────────────
@@ -81,7 +124,13 @@ async function refreshStatus() {
     if (version) version.textContent = `v${body.version}`;
     if (versionValue) versionValue.textContent = `v${body.version}`;
     if (uptime) uptime.textContent = formatUptime(body.uptime_seconds);
-    if (dot) dot.classList.remove('is-error', 'is-warn');
+    if (dot) {
+      // The local service answering is not the same as the bridge working: the
+      // relay can be standing down or unable to write its ledger while this
+      // request succeeds. Amber for that, so the dot stops being a lie.
+      dot.classList.remove('is-error');
+      dot.classList.toggle('is-warn', body.relay?.needs_attention === true);
+    }
   } catch (e) {
     if (conn) conn.textContent = 'Sin conexión';
     if (count) count.textContent = '—';
@@ -123,20 +172,14 @@ function renderRelay(status: RelayStatus) {
   const serverInput = document.getElementById('server-url') as HTMLInputElement | null;
 
   if (state) {
-    // "En espera" comes first, and before the paired check, because it is true
-    // regardless of pairing and it is the only one of these the cashier can fix
-    // from where they are standing. Calling it "Reconectando…" — which is what
-    // this used to show — points them at the internet for a problem that is a
-    // second bridge open on their own desktop.
-    state.textContent = status.blockedByAnotherInstance
-      ? 'En espera'
-      : !status.paired
-        ? 'Sin vincular'
-        : status.connected
-          ? 'Conectado'
-          : status.tokenRejected
-            ? 'Rechazada'
-            : 'Reconectando…';
+    // One lookup, no precedence to get wrong. The nested ternary this replaces
+    // had to encode an order — "En espera" before the paired check, and so on —
+    // and every condition without a branch of its own landed on "Reconectando…",
+    // the sentence for a problem that is on the internet rather than on this
+    // desk. `connecting` is now the only state that says that, and it is the
+    // only one that means it.
+    state.textContent =
+      RELAY_STATE_LABEL[status.state] ?? (status.paired ? 'Reconectando…' : 'Sin vincular');
   }
   if (label) {
     label.textContent = status.label
@@ -149,13 +192,22 @@ function renderRelay(status: RelayStatus) {
   if (failed) failed.textContent = String(status.jobsFailed);
 
   if (error) {
-    // A bridge that has stood down must explain itself even when it was never
-    // paired: it is the copy that will not print, and the sentence names the
-    // process to close.
-    if (status.lastError && (status.paired || status.blockedByAnotherInstance)) {
+    // A bridge that is not going to print must explain itself even when it was
+    // never paired: the sentence names the process to close, or the disk to
+    // check, and pairing it would not have helped either way.
+    //
+    // `ledgerRecovered` outranks the rest when there is nothing wrong right
+    // now: the bridge is working, and the one thing worth saying is that a
+    // ticket from just before may come out twice.
+    const stuck = status.state === 'standby' || status.state === 'ledger-unavailable';
+    if (status.lastError && (status.paired || stuck)) {
       error.textContent = status.lastError;
       error.hidden = false;
-      error.classList.toggle('is-error', status.blockedByAnotherInstance);
+      error.classList.toggle('is-error', stuck);
+    } else if (status.ledgerRecovered) {
+      error.textContent = status.ledgerRecovered;
+      error.hidden = false;
+      error.classList.remove('is-error');
     } else {
       error.hidden = true;
     }

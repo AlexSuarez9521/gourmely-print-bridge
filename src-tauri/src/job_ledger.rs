@@ -49,9 +49,42 @@
 //! which a rewrite-the-whole-file design does not. Compaction — which also
 //! evicts anything older than [`RETENTION`] — happens on load and whenever the
 //! file grows past [`COMPACT_AT_ENTRIES`], so the file cannot grow without end.
+//!
+//! # A damaged file must not be a permanent outage
+//!
+//! Everything above is about not printing twice. This part is about printing at
+//! all. [`JobLedger::open`] is the first thing `relay::supervise` does, and
+//! `acquire_ledger` retries it for ever — deliberately, because the usual reason
+//! it fails is a second bridge that somebody is about to close. But the retry is
+//! only right for a condition that **goes away on its own**, and a file that
+//! cannot be read is not one: it fails identically every fifteen seconds until
+//! the end of time, with the process alive, the tray icon normal and `/health`
+//! answering. That was reproduced on the real binary — a ledger with a non-UTF-8
+//! tail, the shape a dirty shutdown leaves on NTFS, and the relay never joined
+//! the room again.
+//!
+//! So loading is written to give ground in the smallest steps it can:
+//!
+//! 1. **A line it cannot read is skipped, and the rest is kept.** Bad bytes and
+//!    bad JSON get the same treatment the torn tail always got. Nothing else in
+//!    the file is worth losing over one damaged record, and every id that
+//!    survives is a ticket that will not print twice.
+//! 2. **Only when the file cannot be read at all** — an I/O error, not a
+//!    decoding one — is it renamed aside as `…jsonl.corrupt-<unix>` and a fresh
+//!    one started. This is the step that costs something: the ids in that file
+//!    are gone, so a job the server still has in `sent` can come back and print a
+//!    second time. It is chosen anyway, because the alternative is a till that
+//!    never prints again and says nothing, and because a duplicate ticket is
+//!    visible on paper within minutes while a mute bridge is found by a customer
+//!    asking for a receipt. The file is preserved, never deleted, so the record
+//!    can still be read by hand.
+//! 3. **If even the rename fails**, `open` still errors and the relay keeps
+//!    retrying — that one really is a condition a human can clear (permissions,
+//!    antivirus, a full disk), and it now shows up as its own state instead of
+//!    "Reconectando…".
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -105,6 +138,41 @@ struct Entry {
     error: Option<String>,
 }
 
+/// What a damaged ledger cost on the way in, when it cost anything.
+///
+/// Kept on the open ledger — rather than only logged — because the two cases
+/// below have different consequences for the restaurant and somebody has to be
+/// able to find out which one happened without reading a log file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerRecovery {
+    /// Lines that were not readable text were dropped; every other record was
+    /// kept. The reprint risk is limited to the jobs those lines named.
+    Salvaged { lines: usize },
+    /// The file could not be read at all, so it was renamed aside and a new one
+    /// started. Every id it held is gone: a job the server has not seen acked
+    /// can print a second time.
+    SetAside { kept: PathBuf, reason: String },
+}
+
+impl LedgerRecovery {
+    /// The sentence for whoever is looking at the till, not for the log.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Salvaged { lines } => format!(
+                "El registro de impresiones tenía {lines} línea(s) ilegibles y se descartaron. \
+                 El resto se conservó: si alguno de esos trabajos vuelve del servidor, podría \
+                 imprimirse otra vez."
+            ),
+            Self::SetAside { kept, .. } => format!(
+                "El registro de impresiones no se podía leer. Se guardó una copia en {} y se \
+                 empezó uno nuevo para no dejar la caja sin imprimir; algún ticket reciente \
+                 podría salir por segunda vez.",
+                kept.display()
+            ),
+        }
+    }
+}
+
 /// The answer to "have I seen this job before?".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -134,6 +202,9 @@ pub struct JobLedger {
     /// one fails, so a broken disk is retried periodically instead of on every
     /// single ticket.
     compact_at: usize,
+    /// Set when this ledger only exists because damage was worked around. The
+    /// relay copies it into its status so the UI and `/health` can say so.
+    recovery: Option<LedgerRecovery>,
 }
 
 fn now_secs() -> u64 {
@@ -159,6 +230,10 @@ impl JobLedger {
     /// Stand down, not stop: `relay::acquire_ledger` retries and says so in the
     /// UI, because the other copy can be closed and a bridge that gave up for
     /// good was a till that never printed again.
+    ///
+    /// A damaged file is **not** one of the failures: see the module header for
+    /// why a corrupt ledger is salvaged or set aside instead of blocking, and
+    /// what that costs.
     pub fn open(path: impl Into<PathBuf>) -> BridgeResult<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -168,13 +243,57 @@ impl JobLedger {
         // it, and doing either while another bridge is doing the same is how
         // the duplicate happens.
         let lock = InstanceLock::acquire(lock_path_for(&path))?;
-        let (seen, lines) = read_all(&path)?;
+        let (load, recovery) = match read_all(&path) {
+            Ok(load) => {
+                let recovery = (load.unreadable > 0).then_some(LedgerRecovery::Salvaged {
+                    lines: load.unreadable,
+                });
+                (load, recovery)
+            }
+            // The file exists and cannot be read: a bad sector, a handle
+            // somebody else holds without sharing, a device that went away.
+            // It is preserved under another name and this bridge starts a new
+            // one, because waiting does not fix any of those.
+            //
+            // The `?` on the rename is doing more than propagating an error,
+            // and it is worth spelling out: **a file that is merely busy cannot
+            // be renamed either.** A backup agent or an antivirus holding the
+            // ledger open for a few seconds fails the read *and* fails the
+            // move, so this arm returns `Err`, `acquire_ledger` waits, and the
+            // records come back intact when the handle closes — exactly the old
+            // behaviour, for exactly the case where the old behaviour was right.
+            // What gets through to the quarantine is the set of failures where
+            // the metadata is fine and the contents are not, which are the
+            // permanent ones. Verified on Windows by
+            // `a_ledger_that_cannot_even_be_moved_aside_still_fails_loudly`.
+            Err(e) => {
+                let kept = set_aside(&path)?;
+                tracing::error!(
+                    err = %e,
+                    kept = %kept.display(),
+                    "the print ledger could not be read; it was preserved under a new name and \
+                     an empty one started. Jobs the server replays from before this point may \
+                     print a second time"
+                );
+                (
+                    Load::default(),
+                    Some(LedgerRecovery::SetAside {
+                        kept,
+                        reason: e.to_string(),
+                    }),
+                )
+            }
+        };
+        if let Some(recovery) = &recovery {
+            tracing::error!(path = %path.display(), "{}", recovery.message());
+        }
         let mut ledger = Self {
             path,
             _lock: lock,
-            seen,
-            lines,
+            seen: load.seen,
+            lines: load.lines,
             compact_at: COMPACT_AT_ENTRIES,
+            recovery,
         };
         // Best effort, deliberately. `read_all` above is what this ledger
         // actually needs to be correct; compaction only evicts expired entries
@@ -184,6 +303,12 @@ impl JobLedger {
         // `AlreadyDone` rather than `Fresh`, which is the safe direction.
         ledger.compact_best_effort();
         Ok(ledger)
+    }
+
+    /// What opening this ledger cost, when it cost anything. `None` on the
+    /// ordinary path, which is almost always.
+    pub fn recovery(&self) -> Option<&LedgerRecovery> {
+        self.recovery.as_ref()
     }
 
     /// Claims `job_id` **and flushes to disk before returning**.
@@ -320,7 +445,7 @@ impl JobLedger {
     /// process's memory of what it printed fully intact.
     fn compact(&mut self) -> BridgeResult<()> {
         // What is genuinely on disk, not what this process remembers writing.
-        let (mut live, _) = read_all(&self.path)?;
+        let mut live = read_all(&self.path)?.seen;
 
         // Fold our own view on top. `append` writes the line before it updates
         // the map, so in a healthy run this adds nothing; it matters when the
@@ -409,31 +534,85 @@ fn finality(state: JobState) -> u8 {
     }
 }
 
-/// Reads every line, last state per job wins. A malformed line — the torn tail
-/// of an interrupted write — is skipped, not fatal: refusing to boot over it
-/// would take printing down for a partial line nobody can fix by hand.
-fn read_all(path: &Path) -> BridgeResult<(HashMap<String, Entry>, usize)> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((HashMap::new(), 0)),
+/// Renames a ledger that cannot be read out of the way, keeping it.
+///
+/// Never deletes. The file is the only record of what this till printed, and
+/// even a file that this program cannot parse can be opened by a person with a
+/// hex viewer when a customer swears they were charged twice. The name carries
+/// the timestamp so a till that hits this twice does not overwrite the first
+/// copy — which would be the one bit of evidence worth having.
+fn set_aside(path: &Path) -> BridgeResult<PathBuf> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".corrupt-{}", now_secs()));
+    let kept = PathBuf::from(name);
+    std::fs::rename(path, &kept)?;
+    Ok(kept)
+}
+
+/// One pass over the ledger file.
+#[derive(Default)]
+struct Load {
+    seen: HashMap<String, Entry>,
+    /// Physical lines, so the caller can decide when to compact.
+    lines: usize,
+    /// Lines whose **bytes** were not text at all. Counted apart from the ones
+    /// that were text but not JSON, because only this kind means the file was
+    /// damaged rather than merely interrupted, and only this kind is worth
+    /// telling the operator about.
+    unreadable: usize,
+}
+
+/// Reads every line, last state per job wins.
+///
+/// Nothing in one line can stop the others from loading. A torn tail (text, not
+/// JSON) has always been skipped — refusing to boot over a partial line nobody
+/// can fix by hand would take printing down for nothing. Bytes that are not
+/// valid UTF-8 now get exactly the same treatment, and that is the whole of the
+/// fix: reading through `BufReader::lines` made one bad byte fail the **entire
+/// read**, `JobLedger::open` returned `Err`, and `relay::acquire_ledger` retried
+/// it every fifteen seconds for as long as the till stayed on. Every id in the
+/// undamaged 99% of the file was lost with it, which is also why skipping beats
+/// setting the file aside: the records that survive are the ones stopping
+/// reprints.
+///
+/// Reading the file whole rather than streaming it is deliberate: the loader has
+/// to look at raw bytes to be able to skip them, compaction keeps the file to a
+/// few hundred lines, and a ledger that outgrew memory would be a bug elsewhere.
+fn read_all(path: &Path) -> BridgeResult<Load> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Load::default()),
         Err(e) => return Err(e.into()),
     };
-    let mut seen = HashMap::new();
-    let mut lines = 0usize;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        lines += 1;
+    if bytes.is_empty() {
+        return Ok(Load::default());
+    }
+
+    let mut load = Load::default();
+    // Drop the trailing newline before splitting so a well-formed file does not
+    // report a phantom empty last line; `lines` feeds the compaction threshold.
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    for raw in body.split(|b| *b == b'\n') {
+        load.lines += 1;
+        let Ok(line) = std::str::from_utf8(raw) else {
+            load.unreadable += 1;
+            tracing::warn!(
+                bytes = raw.len(),
+                "skipping a line of the print ledger that is not readable text"
+            );
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<Entry>(&line) {
+        match serde_json::from_str::<Entry>(line) {
             Ok(entry) => {
-                seen.insert(entry.job_id.clone(), entry);
+                load.seen.insert(entry.job_id.clone(), entry);
             }
             Err(e) => tracing::warn!(err = %e, "skipping unreadable line in the print ledger"),
         }
     }
-    Ok((seen, lines))
+    Ok(load)
 }
 
 #[cfg(test)]
@@ -542,6 +721,139 @@ mod tests {
         assert!(
             on_disk.lines().count() <= 2,
             "file was rewritten, not grown"
+        );
+    }
+
+    // ── A file the loader cannot fully read ─────────────────────────────
+    //
+    // Reproduced on the shipped binary before this was written: a ledger with a
+    // non-UTF-8 tail — what a power cut at the till leaves on NTFS — made
+    // `open` fail, `acquire_ledger` retry every fifteen seconds for ever, and
+    // the relay never join the room again. Process alive, tray icon normal,
+    // `/health` answering `ok:true`, and not one ticket for the rest of the day.
+
+    /// Bytes that are not text must cost their own line and nothing else.
+    ///
+    /// Put `BufReader::lines()` back in `read_all` and this goes red on the very
+    /// first line: `open` returns `Err(Io)` — "stream did not contain valid
+    /// UTF-8" — and the till is mute until someone deletes a file they have
+    /// never heard of.
+    #[test]
+    fn a_ledger_with_unreadable_bytes_still_opens_and_keeps_the_rest() {
+        let path = temp_path("corrupt-tail");
+        let at = now_secs();
+        let mut body =
+            format!("{{\"jobId\":\"ticket-1\",\"state\":\"printed\",\"at\":{at}}}\n").into_bytes();
+        // The tail of a block another file used to own.
+        body.extend_from_slice(&[0xff, 0xfe, 0x80, 0x9f, 0xc3, 0x28, b'\n']);
+        body.extend_from_slice(
+            format!("{{\"jobId\":\"ticket-2\",\"state\":\"printed\",\"at\":{at}}}\n").as_bytes(),
+        );
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(&path, &body).expect("seed");
+
+        {
+            let mut ledger =
+                JobLedger::open(&path).expect("a damaged line must not stop the till printing");
+
+            // Both records survive — including the one AFTER the damage, which
+            // a loader that gave up at the first bad byte would never reach.
+            for id in ["ticket-1", "ticket-2"] {
+                assert_eq!(
+                    ledger.claim(id).expect("claim"),
+                    Claim::AlreadyDone {
+                        ok: true,
+                        error: None
+                    },
+                    "{id} was lost with the damaged line and would print a second time"
+                );
+            }
+            assert_eq!(
+                ledger.recovery(),
+                Some(&LedgerRecovery::Salvaged { lines: 1 }),
+                "the operator is told nothing about a file that lost a record"
+            );
+        }
+
+        // And the file heals: the compaction on open rewrote it without the
+        // garbage, so the next boot is an ordinary one.
+        let on_disk = std::fs::read(&path).expect("read");
+        assert!(
+            std::str::from_utf8(&on_disk).is_ok(),
+            "the damaged bytes are still in the file"
+        );
+        assert!(
+            JobLedger::open(&path).expect("reopen").recovery().is_none(),
+            "the ledger reports damage it already cleaned up"
+        );
+    }
+
+    /// A file that cannot be read at all is preserved and replaced, because the
+    /// alternative is a bridge that never prints again.
+    ///
+    /// The injection is a directory where the ledger goes: `std::fs::read` fails
+    /// on it for real, the same `?` a bad sector takes.
+    #[test]
+    fn a_ledger_that_cannot_be_read_is_kept_aside_instead_of_blocking_for_ever() {
+        let path = temp_path("unreadable");
+        std::fs::create_dir_all(&path).expect("a directory where the ledger goes");
+
+        let mut ledger = JobLedger::open(&path)
+            .expect("an unreadable ledger must not leave the till mute for ever");
+        let Some(LedgerRecovery::SetAside { kept, reason }) = ledger.recovery().cloned() else {
+            panic!(
+                "expected the file to be set aside, got {:?}",
+                ledger.recovery()
+            );
+        };
+        println!(
+            "[f2] kept the unreadable ledger at {} ({reason})",
+            kept.display()
+        );
+        assert!(kept.exists(), "the evidence was deleted instead of kept");
+        assert!(
+            kept.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(".corrupt-")),
+            "unhelpful name for the preserved file: {}",
+            kept.display()
+        );
+
+        // And it works from here: this is the whole point of setting it aside.
+        assert_eq!(ledger.claim("after").expect("claim"), Claim::Fresh);
+        ledger.finish("after", true, None).expect("finish");
+        assert_eq!(
+            ledger.claim("after").expect("claim"),
+            Claim::AlreadyDone {
+                ok: true,
+                error: None
+            }
+        );
+    }
+
+    /// The one case that still refuses to open — and must, because a human has
+    /// to clear it. Windows only: `share_mode(0)` is how a file becomes
+    /// unreadable *and* unrenameable, which is what antivirus looks like.
+    #[cfg(windows)]
+    #[test]
+    fn a_ledger_that_cannot_even_be_moved_aside_still_fails_loudly() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = temp_path("locked-out");
+        std::fs::write(&path, b"{\"jobId\":\"x\",\"state\":\"printed\",\"at\":1}\n").expect("seed");
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0) // nobody else may open it, not even to rename it
+            .open(&path)
+            .expect("hold the ledger open with no sharing");
+
+        let Err(err) = JobLedger::open(&path) else {
+            panic!("a ledger that can be neither read nor moved must not look fine");
+        };
+        println!("[f2] refused, as it should: {err}");
+        assert!(
+            matches!(err, BridgeError::Io(_)),
+            "the relay decides what to show from the error kind: {err:?}"
         );
     }
 
@@ -770,7 +1082,9 @@ mod tests {
         block_the_temp_file(&path);
         let id = format!("ticket-{}", COMPACT_AT_ENTRIES / 2);
         assert_eq!(
-            ledger.claim(&id).expect("a claim must not fail over housekeeping"),
+            ledger
+                .claim(&id)
+                .expect("a claim must not fail over housekeeping"),
             Claim::Fresh,
             "the till stopped printing because a log file could not be shrunk"
         );

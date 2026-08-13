@@ -139,11 +139,102 @@ fn one() -> u32 {
     1
 }
 
+/// Where the relay is, as one value.
+///
+/// # Why an enum arrived late, and why it is worth the churn
+///
+/// This started as three booleans (`connected`, `token_rejected`,
+/// `blocked_by_another_instance`) and every new condition wanted a fourth. That
+/// shape has two costs, and the second one shipped:
+///
+/// * it can spell states that cannot exist — connected *and* rejected — so every
+///   reader has to invent the same precedence, and the tray, the settings window
+///   and `/health` are three chances to invent it differently;
+/// * and everything nobody gave a boolean to collapses into the same `else`. A
+///   ledger the bridge cannot open landed there: `connected=false`,
+///   `blocked=false`, so the tray said **"Reconectando…"** — byte for byte what a
+///   dead router says — for a bridge that was never going to print again and
+///   whose fix was on that machine, not on the internet.
+///
+/// One value, one answer, and adding a state to it makes every surface
+/// non-exhaustive at once instead of silently defaulting.
+///
+/// The booleans stay on [`RelayStatus`] and are *derived* from this at the
+/// boundary — the settings window of an older install reads them by name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelayState {
+    /// No station paired on this till yet. Nothing is wrong.
+    #[default]
+    Unpaired,
+    /// Dialling, or waiting out a backoff. This is the "no internet" shape, and
+    /// the only one of these that fixes itself.
+    Connecting,
+    /// In the room, receiving jobs.
+    Connected,
+    /// The server refused the station token. Fixed from the GourmelyHub panel.
+    Rejected,
+    /// Another copy of the bridge on this machine holds the print ledger, so
+    /// this one stands down. Fixed by closing that copy.
+    Standby,
+    /// The print ledger cannot be opened at all: no disk, no permission, a
+    /// handle held by something else. **Nothing prints through the relay and
+    /// waiting will not change it** — somebody has to clear it on this machine.
+    LedgerUnavailable,
+}
+
+impl RelayState {
+    /// Every variant, so a surface that has to enumerate them cannot miss the
+    /// next one. Used by the test that keeps this and serde in step.
+    pub const ALL: &'static [RelayState] = &[
+        Self::Unpaired,
+        Self::Connecting,
+        Self::Connected,
+        Self::Rejected,
+        Self::Standby,
+        Self::LedgerUnavailable,
+    ];
+
+    /// The wire name, identical to what serde emits.
+    ///
+    /// `/health` is plain JSON built by hand and must not depend on
+    /// `serde_json::to_value` succeeding inside a request handler; the test
+    /// below is what stops the two spellings drifting.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unpaired => "unpaired",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Rejected => "rejected",
+            Self::Standby => "standby",
+            Self::LedgerUnavailable => "ledger-unavailable",
+        }
+    }
+
+    /// Can the server route a ticket here right now?
+    pub fn is_serving(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    /// True while the bridge will not recover on its own. `Connecting` is not
+    /// one of these: an outage ends by itself and the relay comes back.
+    pub fn needs_a_human(self) -> bool {
+        matches!(
+            self,
+            Self::Rejected | Self::Standby | Self::LedgerUnavailable
+        )
+    }
+}
+
 /// What the settings window shows. Everything here is derived; the station
 /// token never leaves the process.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayStatus {
+    /// The single source of truth. The three booleans below are computed from
+    /// it in [`RelayHandle::status`] and kept only for the readers that already
+    /// know them by name.
+    pub state: RelayState,
     pub paired: bool,
     pub connected: bool,
     pub server_url: String,
@@ -163,8 +254,37 @@ pub struct RelayStatus {
     /// their own desktop and the fix is to close it. Showing them the wrong one
     /// sends support after a network problem that does not exist.
     pub blocked_by_another_instance: bool,
+    /// Set once, when the print ledger only opened because damage was worked
+    /// around. It is not an error — the bridge is printing — but it is the one
+    /// condition under which a ticket can come out twice, so it is said out
+    /// loud instead of living in a log file. See [`crate::job_ledger`].
+    pub ledger_recovered: Option<String>,
     pub jobs_printed: u64,
     pub jobs_failed: u64,
+}
+
+impl RelayStatus {
+    /// One sentence for whoever is looking at the till. The tray, the settings
+    /// window and `/health` all render *this*, so the three cannot disagree.
+    pub fn detail(&self) -> String {
+        match self.state {
+            RelayState::Connected => match self.label.as_deref() {
+                Some(label) => format!("Conectado a GourmelyHub como «{label}»."),
+                None => "Conectado a GourmelyHub.".to_string(),
+            },
+            RelayState::Unpaired => {
+                "Esta caja no está vinculada a ninguna estación (Ajustes → Estación).".to_string()
+            }
+            RelayState::Connecting => self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Sin conexión con GourmelyHub; reintentando.".to_string()),
+            RelayState::Rejected | RelayState::Standby | RelayState::LedgerUnavailable => self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "El bridge no puede recibir impresiones remotas.".to_string()),
+        }
+    }
 }
 
 /// Handle the rest of the app talks to.
@@ -178,6 +298,12 @@ pub struct RelayHandle {
 }
 
 impl RelayHandle {
+    /// The status as everything outside this module sees it.
+    ///
+    /// The three legacy booleans are written **here and nowhere else**, from
+    /// `state`. That is the point of the refactor: no code path can leave
+    /// `connected` true next to `tokenRejected` true, and a new state cannot
+    /// quietly inherit some other state's flags.
     pub fn status(&self) -> RelayStatus {
         let mut snapshot = match self.status.read() {
             Ok(g) => g.clone(),
@@ -188,6 +314,9 @@ impl RelayHandle {
         snapshot.server_url = settings.server_url();
         snapshot.label = settings.label.clone();
         snapshot.roles = settings.roles.clone();
+        snapshot.connected = snapshot.state == RelayState::Connected;
+        snapshot.token_rejected = snapshot.state == RelayState::Rejected;
+        snapshot.blocked_by_another_instance = snapshot.state == RelayState::Standby;
         snapshot
     }
 
@@ -195,6 +324,32 @@ impl RelayHandle {
     pub fn reconnect(&self) {
         self.wake.notify_waiters();
         self.wake.notify_one();
+    }
+
+    /// Moves to `state`, leaving the last message alone.
+    ///
+    /// Used where the message is still the right one: a dropped socket sets the
+    /// reason, and every retry after it is the same reason until something else
+    /// happens. Clearing it on each attempt would make the panel blink between
+    /// an explanation and nothing.
+    fn set_state(&self, state: RelayState) {
+        self.mutate(|s| s.state = state);
+    }
+
+    /// Moves to `state` and says why, in the words the operator needs.
+    fn fail(&self, state: RelayState, message: String) {
+        self.mutate(|s| {
+            s.state = state;
+            s.last_error = Some(message);
+        });
+    }
+
+    /// In the room. Nothing to explain any more.
+    fn joined(&self) {
+        self.mutate(|s| {
+            s.state = RelayState::Connected;
+            s.last_error = None;
+        });
     }
 
     fn mutate(&self, f: impl FnOnce(&mut RelayStatus)) {
@@ -298,11 +453,51 @@ type Outbound = mpsc::UnboundedSender<String>;
 /// See [`acquire_ledger`]: the loser waits and keeps asking, so closing the
 /// duplicate brings this one back with no restart. Standing down permanently
 /// was its own outage.
+/// **Must be called from inside a tokio runtime**, because [`spawn_with`] ends
+/// in `tokio::spawn`. Anywhere else — Tauri's `setup` hook, a plain `#[test]` —
+/// this panics with *"there is no reactor running"*. Use [`spawn_on`] there.
 pub fn spawn(settings: SettingsStore) -> RelayHandle {
     let ledger_path = crate::config::data_dir()
         .map(|d| d.join("print-jobs.jsonl"))
         .unwrap_or_else(|| PathBuf::from("print-jobs.jsonl"));
     spawn_with(settings, ledger_path, PrinterBeat::new(printer::list))
+}
+
+/// [`spawn`] from a thread that is **not** inside the runtime.
+///
+/// # The most expensive line in this project
+///
+/// `tokio::spawn` needs a reactor in thread-local context. Tauri's `setup` hook
+/// runs on the main thread, outside it, so calling [`spawn`] there panics before
+/// the window exists and the whole app exits 101 — which is exactly what shipped
+/// on `feat/relay`: every launch died at `relay.rs`, and the entire relay test
+/// suite was green the whole time because `#[tokio::test]` enters a runtime for
+/// you. The fix was one `enter()` guard in `lib.rs` and it had no test of its
+/// own, so nothing stopped it coming back.
+///
+/// It lives here now for that reason: as a named function in the library it can
+/// be called from a plain `#[test]`, which is the cheapest thing that fails when
+/// the guard goes away. `tests/app_smoke.rs` is the other half and the one that
+/// still bites if `lib.rs` stops calling this at all — it starts the real binary
+/// and asks it whether it is alive.
+///
+/// Entering a handle rather than switching to `tauri::async_runtime::spawn`
+/// keeps this module free of any Tauri dependency, which is what lets the
+/// integration tests drive it with no desktop app around them.
+pub fn spawn_on(runtime: &tokio::runtime::Handle, settings: SettingsStore) -> RelayHandle {
+    inside(runtime, || spawn(settings))
+}
+
+/// The guard, and nothing else.
+///
+/// One line with its own name so a test can drive it against a ledger path of
+/// its own — [`spawn`] resolves that from `data_dir()`, and a unit test has no
+/// business writing to the `%PROGRAMDATA%` of the machine it runs on. Delete the
+/// `enter()` here and `spawn_on_starts_the_supervisor_from_a_synchronous_caller`
+/// fails with the panic that used to take the shipped app down.
+fn inside<T>(runtime: &tokio::runtime::Handle, start: impl FnOnce() -> T) -> T {
+    let _entered = runtime.enter();
+    start()
 }
 
 /// [`spawn`] with the two things a test needs to control: where the ledger
@@ -342,8 +537,7 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
         let settings = handle.settings.snapshot();
         let Some(token) = settings.station_token.clone() else {
             handle.mutate(|s| {
-                s.connected = false;
-                s.token_rejected = false;
+                s.state = RelayState::Unpaired;
                 s.last_error = None;
             });
             tracing::info!("relay idle: this bridge is not paired to a station yet");
@@ -354,6 +548,7 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
 
         let url = engineio::websocket_url(&settings.server_url());
         tracing::info!(url = %url, "relay connecting");
+        handle.set_state(RelayState::Connecting);
 
         let started = Instant::now();
         let ended = run_connection(&handle, &url, &token, &tx, &outbound, &printers).await;
@@ -362,19 +557,16 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
         if let Ok(mut guard) = outbound.lock() {
             *guard = None;
         }
-        handle.mutate(|s| s.connected = false);
 
         let delay = match ended {
             Ended::Rejected(msg) => {
                 tracing::error!(err = %msg, "relay rejected: the station token is not valid");
-                handle.mutate(|s| {
-                    s.token_rejected = true;
-                    s.last_error = Some(
-                        "El servidor rechazó esta estación. Genera un código nuevo en \
-                         Configuración → Impresión → Estaciones y vuelve a vincularla."
-                            .into(),
-                    );
-                });
+                handle.fail(
+                    RelayState::Rejected,
+                    "El servidor rechazó esta estación. Genera un código nuevo en \
+                     Configuración → Impresión → Estaciones y vuelve a vincularla."
+                        .into(),
+                );
                 REVOKED_BACKOFF
             }
             Ended::Transport(msg) => {
@@ -382,10 +574,7 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
                     attempt = 0;
                 }
                 tracing::warn!(err = %msg, held_secs = held.as_secs(), attempt, "relay disconnected");
-                handle.mutate(|s| {
-                    s.token_rejected = false;
-                    s.last_error = Some(msg.clone());
-                });
+                handle.fail(RelayState::Connecting, msg.clone());
                 let delay = backoff(attempt);
                 attempt = attempt.saturating_add(1);
                 delay
@@ -435,6 +624,22 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
 /// that was briefly unreadable — antivirus, a network profile, a disk that
 /// filled up and got cleared — must not cost the till its remote printing until
 /// somebody thinks to restart the app.
+///
+/// # But retrying for ever is only honest if the reason is on screen
+///
+/// The two failures need opposite things from whoever is standing there, and
+/// until [`RelayState`] existed only one of them had a way to say so. A ledger
+/// this bridge could not open reported `connected = false` with no other flag
+/// set, which every surface renders as **"Reconectando…"** — the same words as a
+/// dead router, for a condition that no amount of waiting fixes. Reproduced on
+/// the shipped binary: process alive, `/health` answering, WSS listening, and
+/// the station never in the room again.
+///
+/// A ledger that is merely *damaged* no longer reaches here at all: `open`
+/// salvages it, or preserves it and starts a new one. What is left is the case
+/// where the file cannot even be moved — and that one gets
+/// [`RelayState::LedgerUnavailable`], its own sentence, and its own line in
+/// `/health`.
 async fn acquire_ledger(handle: &RelayHandle, path: &Path) -> JobLedger {
     let mut attempt: u32 = 0;
     loop {
@@ -444,11 +649,24 @@ async fn acquire_ledger(handle: &RelayHandle, path: &Path) -> JobLedger {
                     tracing::info!(path = %path.display(), attempt,
                         "the print ledger is free; the relay is starting");
                 }
+                let recovered = ledger.recovery().map(|r| r.message());
                 handle.mutate(|s| {
-                    s.blocked_by_another_instance = false;
+                    // Deliberately not `Connecting`: the loop is about to decide
+                    // between that and `Unpaired`, and guessing here is what
+                    // would let "Reconectando…" appear on a till that was never
+                    // paired. `Connecting` means "has a token, dialling".
+                    if s.state.needs_a_human() {
+                        s.state = RelayState::Unpaired;
+                    }
                     // Only clear a message this loop is responsible for.
                     if attempt > 0 {
                         s.last_error = None;
+                    }
+                    // Damage that was worked around is not an error and must not
+                    // be cleared by the next reconnect: it is the one thing that
+                    // can make a ticket come out twice, so it stays on screen.
+                    if recovered.is_some() {
+                        s.ledger_recovered = recovered;
                     }
                 });
                 return ledger;
@@ -459,26 +677,22 @@ async fn acquire_ledger(handle: &RelayHandle, path: &Path) -> JobLedger {
                 if attempt.is_multiple_of(LEDGER_LOG_EVERY) {
                     tracing::error!(path = %path.display(), attempt, "{msg}");
                 }
-                handle.mutate(|s| {
-                    s.connected = false;
-                    s.blocked_by_another_instance = true;
-                    s.last_error = Some(msg);
-                });
+                handle.fail(RelayState::Standby, msg);
             }
             Err(e) => {
                 if attempt.is_multiple_of(LEDGER_LOG_EVERY) {
                     tracing::error!(err = %e, path = %path.display(), attempt,
                         "cannot open the print ledger; the relay is waiting for it");
                 }
-                handle.mutate(|s| {
-                    s.connected = false;
-                    s.blocked_by_another_instance = false;
-                    s.last_error = Some(format!(
-                        "No se puede escribir el registro de impresiones en {}: {e}. \
-                         El bridge lo seguirá intentando.",
+                handle.fail(
+                    RelayState::LedgerUnavailable,
+                    format!(
+                        "El bridge no puede abrir su registro de impresiones en {}: {e}. \
+                         No imprimirá pedidos remotos hasta que se resuelva en este equipo \
+                         (espacio en disco, permisos o antivirus). Lo seguirá intentando.",
                         path.display()
-                    ));
-                });
+                    ),
+                );
             }
         }
 
@@ -593,11 +807,7 @@ async fn run_connection(
     }
 
     tracing::info!("relay connected");
-    handle.mutate(|s| {
-        s.connected = true;
-        s.token_rejected = false;
-        s.last_error = None;
-    });
+    handle.joined();
 
     // One writer owns the sink. Acks come from the print worker, heartbeats
     // from the reader, presence from a timer: funnelling them through a channel
@@ -983,6 +1193,86 @@ mod tests {
         }
     }
 
+    // ── Starting the supervisor from outside the runtime (F1) ───────────
+
+    /// Why `spawn_on` exists at all, stated as a test.
+    ///
+    /// A plain `#[test]` has no reactor — the same condition Tauri's `setup`
+    /// hook runs in — and `tokio::spawn` panics there. If this ever stops
+    /// panicking, the guard downstream is free to go; while it does panic, that
+    /// guard is load-bearing and `lib.rs` must not call `spawn` directly.
+    #[test]
+    fn spawning_the_relay_outside_a_runtime_panics() {
+        let settings = SettingsStore::in_memory(Settings::default());
+        let ledger = temp_dir("no-runtime").join("print-jobs.jsonl");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spawn_with(
+                settings,
+                ledger,
+                beat_with(Duration::from_secs(1), || Ok(vec![])),
+            )
+        }));
+        let message = panicked
+            .err()
+            .map(|e| {
+                e.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            })
+            .expect("tokio::spawn outside a runtime has to panic, or lib.rs needs no guard");
+        println!("[f1] {message}");
+        assert!(
+            message.contains("no reactor running"),
+            "the panic changed shape; the guard in `spawn_on` may no longer be the fix: {message}"
+        );
+    }
+
+    /// And the fix, exercised the way `lib.rs` uses it: a synchronous caller
+    /// with a runtime handle in hand.
+    ///
+    /// `inside` is the whole of `spawn_on` apart from where the ledger path
+    /// comes from. Take the `enter()` out of it and this test becomes the panic
+    /// above — in under a second, with no desktop, no window and no binary. The
+    /// binary half, which also covers `lib.rs` calling the wrong function, is
+    /// `tests/app_smoke.rs`.
+    #[test]
+    fn spawn_on_starts_the_supervisor_from_a_synchronous_caller() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = temp_dir("spawn-on");
+        let ledger = dir.join("print-jobs.jsonl");
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some("http://127.0.0.1:1".into()),
+            station_token: Some("station-token-under-test".into()),
+            ..Default::default()
+        });
+
+        // Not `block_on`, not `#[tokio::test]`: this call is made from a thread
+        // with no reactor, which is the condition that took the app down.
+        let handle = inside(runtime.handle(), || {
+            spawn_with(
+                settings,
+                ledger.clone(),
+                beat_with(Duration::from_secs(1), || Ok(vec!["Caja".into()])),
+            )
+        });
+
+        // And the supervisor really is turning — it took the ledger, which is
+        // its first act. A handle that was merely constructed proves nothing.
+        let took_it = runtime.block_on(wait_for(Duration::from_secs(10), || {
+            crate::job_ledger::lock_path_for(&ledger).exists()
+        }));
+        println!("[f1] status after spawn_on: {:?}", handle.status());
+        assert!(
+            took_it,
+            "spawn_on returned but its task never ran: {:?}",
+            handle.status()
+        );
+    }
+
     #[test]
     fn backoff_grows_and_is_capped() {
         assert!(backoff(0) >= BASE_BACKOFF);
@@ -1297,10 +1587,9 @@ mod tests {
         let ledger = dir.join("print-jobs.jsonl");
 
         // The bridge that got there first.
-        let held = crate::instance_lock::InstanceLock::acquire(
-            crate::job_ledger::lock_path_for(&ledger),
-        )
-        .expect("the first bridge takes the lock");
+        let held =
+            crate::instance_lock::InstanceLock::acquire(crate::job_ledger::lock_path_for(&ledger))
+                .expect("the first bridge takes the lock");
 
         let settings = SettingsStore::in_memory(Settings {
             server_url: Some("http://127.0.0.1:1".into()),
@@ -1364,6 +1653,132 @@ mod tests {
             ),
             "the relay cleared its standby flag without actually taking the ledger"
         );
+    }
+
+    // ── A ledger the bridge cannot open at all (F2) ─────────────────────
+
+    /// The state that used to be indistinguishable from a dead router.
+    ///
+    /// The data folder is a file here, so `create_dir_all` inside
+    /// `JobLedger::open` fails for real — the same `?` a full disk or a locked
+    /// file takes. What matters is not that the relay refuses to connect (it
+    /// always did) but that it now says something a person can act on: this
+    /// one is fixed on the machine, not on the internet, and no amount of
+    /// waiting helps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ledger_that_will_not_open_is_not_reported_as_a_network_problem() {
+        let dir = temp_dir("ledger-unavailable");
+        let blocked = dir.join("not-a-folder");
+        std::fs::write(&blocked, b"a file where the data folder should be").expect("seed");
+
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some("http://127.0.0.1:1".into()),
+            station_token: Some("station-token-under-test".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings,
+            blocked.join("print-jobs.jsonl"),
+            beat_with(Duration::from_secs(1), || Ok(vec!["Caja".into()])),
+        );
+
+        let noticed = wait_for(Duration::from_secs(10), || {
+            handle.status().state == RelayState::LedgerUnavailable
+        })
+        .await;
+        let status = handle.status();
+        println!("[f2] status: {status:?}");
+        println!("[f2] detail: {}", status.detail());
+        assert!(
+            noticed,
+            "a bridge that cannot open its ledger reported something else entirely: {status:?}"
+        );
+
+        // The three things that make it different from an outage.
+        assert!(
+            status.state.needs_a_human(),
+            "shown as a condition that fixes itself"
+        );
+        assert!(!status.connected);
+        assert!(
+            !status.blocked_by_another_instance,
+            "shown as a second bridge, which sends the cashier hunting for a window that is not there"
+        );
+        assert!(
+            !status.token_rejected,
+            "shown as a pairing problem, which sends them to the GourmelyHub panel"
+        );
+        assert_ne!(
+            crate::tray::tooltip_for(&status),
+            crate::tray::tooltip_for(&RelayStatus {
+                state: RelayState::Connecting,
+                paired: true,
+                ..Default::default()
+            }),
+            "byte-identical to «Reconectando…» — the tooltip a dead internet link shows"
+        );
+        let detail = status.detail();
+        assert!(
+            detail.contains("equipo") && detail.contains("registro"),
+            "the sentence has to name what is wrong and where: {detail}"
+        );
+    }
+
+    /// `/health` builds its `state` string by hand — it must not depend on
+    /// `serde_json` inside a request handler — and the settings window reads the
+    /// serde one. Two spellings of the same value, so they are compared here.
+    #[test]
+    fn the_state_reads_the_same_on_both_wires() {
+        for state in RelayState::ALL {
+            let json = serde_json::to_value(state).expect("serialize");
+            assert_eq!(
+                json.as_str(),
+                Some(state.as_str()),
+                "`{state:?}` spells itself differently for /health and for the settings window"
+            );
+        }
+        // And the state actually reaches the JSON the window parses.
+        let status = RelayStatus {
+            state: RelayState::LedgerUnavailable,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json["state"], "ledger-unavailable");
+    }
+
+    /// The booleans the settings window has always read are computed from the
+    /// state at the boundary, so no path can produce a contradictory pair.
+    #[tokio::test]
+    async fn the_legacy_booleans_are_derived_and_cannot_contradict_the_state() {
+        let handle = spawn_with(
+            SettingsStore::in_memory(Settings {
+                station_token: Some("t".into()),
+                ..Default::default()
+            }),
+            temp_dir("derived").join("print-jobs.jsonl"),
+            beat_with(Duration::from_secs(1), || Ok(vec![])),
+        );
+        for (state, connected, rejected, blocked) in [
+            (RelayState::Connected, true, false, false),
+            (RelayState::Rejected, false, true, false),
+            (RelayState::Standby, false, false, true),
+            (RelayState::LedgerUnavailable, false, false, false),
+            (RelayState::Connecting, false, false, false),
+            (RelayState::Unpaired, false, false, false),
+        ] {
+            // Written straight into the shared cell, exactly as a stale write
+            // would be, to prove `status()` is what decides.
+            handle.mutate(|s| {
+                s.state = state;
+                s.connected = true;
+                s.token_rejected = true;
+                s.blocked_by_another_instance = true;
+            });
+            let status = handle.status();
+            assert_eq!(status.connected, connected, "{state:?}");
+            assert_eq!(status.token_rejected, rejected, "{state:?}");
+            assert_eq!(status.blocked_by_another_instance, blocked, "{state:?}");
+        }
     }
 
     #[test]

@@ -30,7 +30,7 @@ use tauri::{
     AppHandle, Emitter, Manager, Runtime,
 };
 
-use crate::relay::RelayStatus;
+use crate::relay::{RelayState, RelayStatus};
 
 /// Event the settings UI listens for to jump straight to the pairing panel.
 pub const OPEN_PAIRING_EVENT: &str = "open-pairing";
@@ -102,20 +102,36 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// it costs no window, no click and no notification.
 ///
 /// A pure function of the status so it can be tested without a desktop.
+///
+/// It reads [`RelayState`] and not the booleans, so a state added to the relay
+/// shows up here as a compile error instead of falling into the `else`. That
+/// `else` is where a bridge whose print ledger could not be opened used to
+/// land — hovering the icon said "Reconectando…", which is the sentence for a
+/// dead router and sends the cashier to the modem for a problem that is on their
+/// own disk.
 pub fn tooltip_for(status: &RelayStatus) -> String {
-    let line = if status.blocked_by_another_instance {
-        "EN ESPERA — ya hay otro GourmelyPrint abierto; esta copia no imprime".to_string()
-    } else if !status.paired {
-        "Sin vincular — abre Ajustes → Estación".to_string()
-    } else if status.token_rejected {
-        "Estación rechazada — vuelve a vincularla".to_string()
-    } else if status.connected {
-        match status.label.as_deref() {
+    let line = match status.state {
+        RelayState::Standby => {
+            "EN ESPERA — ya hay otro GourmelyPrint abierto; esta copia no imprime".to_string()
+        }
+        RelayState::LedgerUnavailable => {
+            "NO PUEDE IMPRIMIR — no logra escribir su registro en este equipo".to_string()
+        }
+        RelayState::Rejected => "Estación rechazada — vuelve a vincularla".to_string(),
+        RelayState::Connected => match status.label.as_deref() {
             Some(label) => format!("Conectado — {label}"),
             None => "Conectado".to_string(),
+        },
+        // Pairing lives in the settings, not in the relay's state machine, so a
+        // bridge that is merely retrying while unpaired is not "reconnecting" —
+        // it has nowhere to connect to yet.
+        RelayState::Unpaired | RelayState::Connecting => {
+            if status.paired {
+                "Reconectando…".to_string()
+            } else {
+                "Sin vincular — abre Ajustes → Estación".to_string()
+            }
         }
-    } else {
-        "Reconectando…".to_string()
     };
     format!("GourmelyPrint Bridge\n{line}")
 }
@@ -201,10 +217,26 @@ mod tests {
 
     fn standing_down() -> RelayStatus {
         RelayStatus {
+            state: RelayState::Standby,
             paired: true,
-            connected: false,
-            blocked_by_another_instance: true,
             last_error: Some("GourmelyPrint Bridge ya está abierto en este equipo".into()),
+            ..Default::default()
+        }
+    }
+
+    fn ledger_broken() -> RelayStatus {
+        RelayStatus {
+            state: RelayState::LedgerUnavailable,
+            paired: true,
+            last_error: Some("El bridge no puede abrir su registro de impresiones".into()),
+            ..Default::default()
+        }
+    }
+
+    fn offline() -> RelayStatus {
+        RelayStatus {
+            state: RelayState::Connecting,
+            paired: true,
             ..Default::default()
         }
     }
@@ -219,8 +251,8 @@ mod tests {
         assert!(tip.contains("no imprime"), "{tip}");
 
         let working = RelayStatus {
+            state: RelayState::Connected,
             paired: true,
-            connected: true,
             label: Some("Caja Principal".into()),
             ..Default::default()
         };
@@ -234,19 +266,16 @@ mod tests {
     fn every_state_gets_its_own_sentence() {
         let unpaired = RelayStatus::default();
         let rejected = RelayStatus {
-            paired: true,
-            token_rejected: true,
-            ..Default::default()
-        };
-        let offline = RelayStatus {
+            state: RelayState::Rejected,
             paired: true,
             ..Default::default()
         };
         let tips = [
             tooltip_for(&unpaired),
             tooltip_for(&rejected),
-            tooltip_for(&offline),
+            tooltip_for(&offline()),
             tooltip_for(&standing_down()),
+            tooltip_for(&ledger_broken()),
         ];
         for (i, a) in tips.iter().enumerate() {
             for b in tips.iter().skip(i + 1) {
@@ -258,16 +287,43 @@ mod tests {
         assert!(tips[2].contains("Reconectando"));
     }
 
+    /// The F2 half that the tray owns.
+    ///
+    /// A bridge whose print ledger cannot be opened is not "reconnecting": it
+    /// will not print until somebody clears something on that machine, and the
+    /// two words send whoever reads them to opposite ends of the shop. Put
+    /// `LedgerUnavailable` back in the `else` — or drop the state and let the
+    /// booleans decide again — and this goes red on the first assertion.
+    #[test]
+    fn a_ledger_the_bridge_cannot_open_does_not_look_like_a_dead_router() {
+        let tip = tooltip_for(&ledger_broken());
+        assert!(
+            !tip.contains("Reconectando"),
+            "shown as a connection problem; the fix is on this machine, not on the internet: {tip}"
+        );
+        assert_ne!(
+            tip,
+            tooltip_for(&offline()),
+            "a broken ledger and a dead internet link are byte-identical on hover"
+        );
+        assert!(tip.contains("NO PUEDE IMPRIMIR"), "{tip}");
+    }
+
     /// A bridge that lost the ledger before it was ever paired still has to
     /// explain itself — "Sin vincular" would send someone off to pair a copy
     /// that is not going to print regardless.
     #[test]
-    fn standing_down_outranks_not_being_paired() {
-        let never_paired = RelayStatus {
-            paired: false,
-            blocked_by_another_instance: true,
-            ..Default::default()
-        };
-        assert!(tooltip_for(&never_paired).contains("EN ESPERA"));
+    fn a_broken_relay_outranks_not_being_paired() {
+        for state in [RelayState::Standby, RelayState::LedgerUnavailable] {
+            let never_paired = RelayStatus {
+                state,
+                paired: false,
+                ..Default::default()
+            };
+            assert!(
+                !tooltip_for(&never_paired).contains("Sin vincular"),
+                "{state:?} was hidden behind the pairing hint"
+            );
+        }
     }
 }

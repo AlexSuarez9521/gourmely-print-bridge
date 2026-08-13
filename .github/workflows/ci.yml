@@ -85,6 +85,12 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
+      # `--all-targets` now also runs `tests/app_smoke.rs`, which LAUNCHES
+      # print-bridge.exe on a scratch data dir and a scratch port and asks it
+      # whether it is serving. That is deliberate: every other test links the
+      # library, so the regression that made the app exit 101 on every launch
+      # went through a fully green suite twice. Expect this step to take ~20 s
+      # longer than it used to.
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --all-targets

@@ -28,6 +28,40 @@ use crate::error::{BridgeError, BridgeResult};
 /// `apps/platform-web/lib/print-bridge.ts` connects to.
 pub const BIND_PORT: u16 = 8181;
 
+/// Env var that moves the local server off [`BIND_PORT`].
+///
+/// It exists for `tests/app_smoke.rs`, which starts the **real binary** and asks
+/// it whether it is alive. Without a port of its own that test either fights
+/// whatever holds 8181 on the machine running it or, worse, passes because it
+/// probed somebody else's bridge. Support gets the same knob for free when two
+/// installs have to coexist for an afternoon.
+///
+/// Nothing else changes with it: the POS connects to 8181 by name, so a value
+/// here is a deliberate, temporary thing.
+const BIND_PORT_ENV: &str = "GOURMELYPRINT_BIND_PORT";
+
+/// [`BIND_PORT`], unless [`BIND_PORT_ENV`] says otherwise. A value that is not a
+/// port is ignored — falling back to the default beats refusing to start over a
+/// typo in an environment variable.
+pub fn bind_port() -> u16 {
+    match std::env::var(BIND_PORT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) if port > 0 => {
+                tracing::warn!(
+                    port,
+                    "{BIND_PORT_ENV} is set: not listening on the usual {BIND_PORT}"
+                );
+                port
+            }
+            _ => {
+                tracing::error!(value = %raw, "{BIND_PORT_ENV} is not a port; using {BIND_PORT}");
+                BIND_PORT
+            }
+        },
+        Err(_) => BIND_PORT,
+    }
+}
+
 /// The DNS name the cert is issued for. Frontend MUST connect via this
 /// name (NOT raw `127.0.0.1`) for the TLS handshake to succeed.
 pub const BRIDGE_HOST: &str = "localhost.gourmelyhub.busticco.com";

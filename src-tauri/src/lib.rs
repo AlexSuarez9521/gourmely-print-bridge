@@ -250,29 +250,25 @@ pub fn run() {
             // it parks itself and wakes up the moment a code is redeemed, so
             // pairing needs no restart at the till.
             //
-            // # Why the runtime is entered by hand
+            // # `spawn_on`, never `spawn`, from here
             //
-            // `relay::spawn` starts its supervisor with `tokio::spawn`, and
-            // **this hook does not run inside the async runtime** — Tauri calls
-            // `setup` from `Builder::build`, on the main thread. Without the
-            // guard below that call panics with *"there is no reactor running"*
-            // and takes the whole app down before the window ever appears.
+            // `relay::spawn` ends in `tokio::spawn`, and **this hook does not
+            // run inside the async runtime** — Tauri calls `setup` from
+            // `Builder::build`, on the main thread. Calling it directly panics
+            // with *"there is no reactor running"* and takes the whole app down
+            // before the window ever appears.
             //
             // It is not a hypothetical: the app on `feat/relay` exited 101 on
             // every launch, verified on a build of a47a19c itself. The feature
             // had only ever been exercised from `#[tokio::test]`, where a
             // runtime is already entered, so the relay tests were all green
-            // while the shipping binary could not start.
-            //
-            // Entering the handle rather than switching to
-            // `tauri::async_runtime::spawn` keeps `relay` free of any Tauri
-            // dependency, which is what lets the integration tests drive the
-            // same code with no desktop app around it.
+            // while the shipping binary could not start — and they stayed green
+            // when the guard was reverted to check, which is why the guard now
+            // lives in a named function with tests of its own. The one that
+            // still bites if this line changes is `tests/app_smoke.rs`: it runs
+            // the built binary and asks it whether it is serving.
             let runtime = tauri::async_runtime::handle();
-            let relay = {
-                let _entered = runtime.inner().enter();
-                relay::spawn(settings.clone())
-            };
+            let relay = relay::spawn_on(runtime.inner(), settings.clone());
             if settings.snapshot().is_paired() {
                 tracing::info!("relay: station already paired, connecting");
             } else {
@@ -299,6 +295,11 @@ pub fn run() {
                 }
             });
 
+            // The local server answers `/health`, which the POS polls to decide
+            // whether this till has a working bridge. Handing it the relay is
+            // what lets that answer mention the half of the bridge the POS
+            // cannot see — see the `server` module header.
+            let server_relay = relay.clone();
             app.manage(relay);
 
             // Spawn the server on Tauri's runtime so it shuts down cleanly
@@ -314,7 +315,9 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let tls = tls_material::resolve(CERT_PEM, KEY_PEM);
                 tracing::info!(source = tls.source, "TLS material resolved");
-                if let Err(e) = server::serve(&tls.cert, &tls.key, server_settings).await {
+                if let Err(e) =
+                    server::serve(&tls.cert, &tls.key, server_settings, Some(server_relay)).await
+                {
                     tracing::error!("server exited: {e}");
                 }
             });
