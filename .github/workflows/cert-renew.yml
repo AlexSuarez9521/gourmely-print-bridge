@@ -7,25 +7,46 @@ name: Cert Renewal
 # gets the new cert via the next installer update (or the Tauri
 # auto-updater).
 #
-# Let's Encrypt certs are valid 90 days. We run every 60 days to keep a
-# 30-day safety buffer.
+# Let's Encrypt certs are valid 90 days. This runs MONTHLY and renews only
+# when fewer than RENEW_WINDOW_DAYS remain, so a single failed run is never
+# fatal: there are two more attempts inside the window.
+#
+# WHY IT IS WRITTEN THIS WAY (2026-08-13). Until today this workflow had never
+# issued a real certificate. The scheduled run of 2026-07-01 failed with nobody
+# watching, and the only "success" on record was a `--dry-run`. When it was
+# finally run for real, certbot DID get the cert — and the very next step threw
+# it away, because `[ -f ... ]` cannot see inside certbot's 0700 root-owned
+# `live/` directory. The dry run skips that step, so the one path that mattered
+# was the only one never exercised. Both things are fixed here; the lesson is
+# that a dry run of a pipeline is not a test of the pipeline.
 #
 # Required secrets:
 #   - CLOUDFLARE_DNS_API_TOKEN : token with Zone:Read + DNS:Edit scope
 #                                limited to the busticco.com zone.
-#   - CERT_RENEWAL_PR_TOKEN    : PAT (or app token) with `repo` scope so
-#                                the workflow can open a PR. GITHUB_TOKEN
-#                                won't trigger downstream workflows from
-#                                the new branch.
+# (CERT_RENEWAL_PR_TOKEN is NO LONGER used: it was a PAT that expired silently
+#  and broke checkout. The job's own GITHUB_TOKEN cannot expire.)
 
 on:
   schedule:
-    # Every 60 days at 03:00 UTC.
-    - cron: "0 3 1 */2 *"
+    # MONTHLY, at 03:00 UTC — and the job exits early unless the shipped cert
+    # has less than RENEW_WINDOW_DAYS left, so this is not a monthly release.
+    #
+    # It used to run every 60 days. That gives ONE attempt per cycle, and on
+    # 2026-07-01 that attempt failed (the Cloudflare secret was missing) with
+    # nobody watching: the next one was due 2026-09-01, five days before the
+    # cert expired. A schedule where a single silent failure can take a
+    # restaurant's printing offline is not a schedule, it is a coin flip.
+    # Monthly gives two spare attempts inside the renewal window.
+    - cron: "0 3 1 * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "If true, run certbot in --dry-run mode (no real cert issued)."
+        required: false
+        default: "false"
+        type: string
+      force:
+        description: "If true, renew even when the shipped cert still has plenty of time left."
         required: false
         default: "false"
         type: string
@@ -41,6 +62,9 @@ concurrency:
 env:
   DOMAIN: "localhost.gourmelyhub.busticco.com"
   CERT_EMAIL: "alexsuarez9521@gmail.com"
+  # Renew when the shipped cert has less than this left. Let's Encrypt issues
+  # for 90 days, so 45 leaves three monthly attempts inside the window.
+  RENEW_WINDOW_DAYS: "45"
 
 jobs:
   renew:
@@ -66,12 +90,37 @@ jobs:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Corre todos los meses, pero solo RENUEVA cuando de verdad hace falta:
+      # así una ejecución fallida no es fatal (quedan más intentos dentro de la
+      # ventana) y tampoco se publica una versión nueva cada mes sin motivo.
+      - name: ¿Hace falta renovar?
+        id: check
+        run: |
+          CERT="src-tauri/certs/fullchain.pem"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Forzado a mano." && echo "renovar=true" >> "$GITHUB_OUTPUT" && exit 0
+          fi
+          if [ ! -f "$CERT" ]; then
+            echo "No hay certificado en el repo todavía." && echo "renovar=true" >> "$GITHUB_OUTPUT" && exit 0
+          fi
+          FIN_TS=$(date -d "$(openssl x509 -enddate -noout -in "$CERT" | cut -d= -f2)" +%s)
+          DIAS=$(( (FIN_TS - $(date +%s)) / 86400 ))
+          echo "El certificado del repo caduca en $DIAS día(s) (ventana: $RENEW_WINDOW_DAYS)."
+          if [ "$DIAS" -le "$RENEW_WINDOW_DAYS" ]; then
+            echo "renovar=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "renovar=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Todavía quedan $DIAS días; no se renueva. Usa force=true para forzarlo."
+          fi
+
       - name: Install certbot + Cloudflare DNS plugin
+        if: steps.check.outputs.renovar == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y certbot python3-certbot-dns-cloudflare
 
       - name: Write Cloudflare credentials
+        if: steps.check.outputs.renovar == 'true'
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_DNS_API_TOKEN }}
         run: |
@@ -87,6 +136,7 @@ jobs:
           chmod 600 "$RUNNER_TEMP/cf/credentials.ini"
 
       - name: Issue / renew cert via DNS-01
+        if: steps.check.outputs.renovar == 'true'
         env:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
@@ -109,12 +159,20 @@ jobs:
             $DRY_FLAG
 
       - name: Copy new cert into the bridge
-        if: inputs.dry_run != 'true'
+        if: steps.check.outputs.renovar == 'true' && inputs.dry_run != 'true'
         run: |
           LIVE_DIR="$RUNNER_TEMP/le/config/live/$DOMAIN"
-          if [ ! -f "$LIVE_DIR/fullchain.pem" ] || [ ! -f "$LIVE_DIR/privkey.pem" ]; then
+          # `sudo test`, not `test`. certbot runs under sudo, so it leaves
+          # `live/` as 0700 root:root — the runner user cannot even stat what is
+          # inside. The plain `[ -f ... ]` therefore reported "no cert files" on
+          # a run where certbot had just printed "Successfully received
+          # certificate", and the job threw away a real 90-day cert with a
+          # message blaming certbot. The dry run never caught it because
+          # `--dry-run` skips this step entirely: the only path that mattered
+          # was the only one nobody exercised.
+          if ! sudo test -f "$LIVE_DIR/fullchain.pem" || ! sudo test -f "$LIVE_DIR/privkey.pem"; then
             echo "::error::certbot did not produce live cert files at $LIVE_DIR"
-            ls -la "$LIVE_DIR" || true
+            sudo ls -la "$LIVE_DIR" || true
             exit 1
           fi
           sudo cp "$LIVE_DIR/fullchain.pem" src-tauri/certs/fullchain.pem
@@ -123,7 +181,7 @@ jobs:
 
       - name: Bump bridge patch version
         id: bump
-        if: inputs.dry_run != 'true'
+        if: steps.check.outputs.renovar == 'true' && inputs.dry_run != 'true'
         # The version lives in THREE files. This step used to bump two of them,
         # which is how Cargo.lock ended up at 0.1.1 while both manifests said
         # 0.1.2. It also re-serialised tauri.conf.json with `json.dumps`, whose
@@ -142,7 +200,7 @@ jobs:
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
 
       - name: Open pull request
-        if: inputs.dry_run != 'true'
+        if: steps.check.outputs.renovar == 'true' && inputs.dry_run != 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
