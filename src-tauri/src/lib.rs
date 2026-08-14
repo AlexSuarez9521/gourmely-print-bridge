@@ -6,17 +6,30 @@
 //!   2. A tokio task spawned at startup runs the WSS server that the
 //!      POS web app connects to. The server stays alive for the entire
 //!      app lifetime and shuts down cleanly when the user quits.
-//!   3. Each WS message dispatches to the `printer` module which talks
-//!      to the Windows print spooler.
+//!   3. A second task runs the `relay`: an outbound, permanent connection
+//!      to GourmelyHub that receives print jobs from anywhere — which is
+//!      what lets a waiter on mobile data send a comanda to the kitchen.
+//!   4. Both paths end in the same `printer` module, which talks to the
+//!      Windows print spooler. There is exactly one way to put ink on
+//!      paper in this program.
+//!
+//! And, before any of it: **exactly one of these processes may exist**. See
+//! [`run`] and [`instance_lock`] — two bridges on one till print every ticket
+//! twice, and the relay is what made that reachable.
 
 pub mod config;
+pub mod engineio;
 pub mod error;
+pub mod instance_lock;
+pub mod job_ledger;
+pub mod pairing;
 pub mod printer;
+pub mod relay;
 pub mod server;
 pub mod tls_material;
 pub mod tray;
 
-use tauri::WindowEvent;
+use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
 /// TLS material embedded at compile time so the installer is a single
@@ -28,6 +41,10 @@ use tauri_plugin_autostart::MacosLauncher;
 /// Same security model as QZ Tray's `localhost.qz.io` cert bundling.
 const CERT_PEM: &[u8] = include_bytes!("../certs/fullchain.pem");
 const KEY_PEM: &[u8] = include_bytes!("../certs/privkey.pem");
+
+/// How often the tray tooltip is compared against the relay's state. Only a
+/// change writes anything, so this is a cheap read of an `RwLock`.
+const TRAY_TOOLTIP_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Tauri command: returns the list of printers registered on this
 /// machine. Exposed both to the WSS clients (via `server::handle`) and
@@ -66,6 +83,75 @@ fn is_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+// ── Estación remota ──────────────────────────────────────────────────
+
+/// Tauri command: redeem a pairing code.
+///
+/// The code is typed by whoever is standing at the till, so everything about
+/// this path is written for them: it normalises what they type, it never
+/// retries a burnt code behind their back, and the error it returns is the
+/// server's own sentence, not a status code.
+#[tauri::command]
+async fn pair_station(
+    app: tauri::AppHandle,
+    code: String,
+    server_url: Option<String>,
+) -> Result<relay::RelayStatus, String> {
+    let settings = app.state::<config::SettingsStore>().inner().clone();
+    let relay = app.state::<relay::RelayHandle>().inner().clone();
+
+    let url = server_url
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| settings.snapshot().server_url());
+
+    let printers = printer::list().unwrap_or_default();
+    pairing::pair(&settings, &url, &code, printers)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Reconnect at once instead of waiting out the idle wait: the operator is
+    // watching the screen and expects "Conectado" now, not in a minute.
+    relay.reconnect();
+    Ok(relay.status())
+}
+
+/// Tauri command: forget the pairing on this machine.
+#[tauri::command]
+fn unpair_station(app: tauri::AppHandle) -> Result<relay::RelayStatus, String> {
+    let settings = app.state::<config::SettingsStore>().inner().clone();
+    let relay = app.state::<relay::RelayHandle>().inner().clone();
+    pairing::forget(&settings).map_err(|e| e.to_string())?;
+    relay.reconnect();
+    Ok(relay.status())
+}
+
+/// Tauri command: everything the "Estación" panel paints. Never includes the
+/// station token.
+#[tauri::command]
+fn relay_status(app: tauri::AppHandle) -> relay::RelayStatus {
+    app.state::<relay::RelayHandle>().status()
+}
+
+/// Tauri command: the local secret the POS will have to present once the web
+/// starts sending it. Shown in the settings window so support can copy it
+/// without opening `config.json` with a text editor.
+#[tauri::command]
+fn local_secret(app: tauri::AppHandle) -> Option<String> {
+    app.state::<config::SettingsStore>().snapshot().local_secret
+}
+
+/// Tauri command: pick the printer to use for jobs that arrive without a name
+/// of their own (role-room delivery).
+#[tauri::command]
+fn set_default_printer(app: tauri::AppHandle, name: Option<String>) -> Result<(), String> {
+    let settings = app.state::<config::SettingsStore>().inner().clone();
+    settings
+        .update(|s| s.default_printer = name.filter(|n| !n.trim().is_empty()))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -80,7 +166,36 @@ pub fn run() {
         env!("CARGO_PKG_VERSION")
     );
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // single-instance FIRST, before any other plugin gets to do work.
+    //
+    // A second launch of the bridge is not a cosmetic annoyance: both copies
+    // dial out to GourmelyHub with the same station token, land in the same
+    // room, and the server pushes every print job down both sockets. One order,
+    // two comandas, and nothing in the logs that says why. Before the relay the
+    // second copy was harmless only by accident — it could not take port 8181
+    // and sat there inert.
+    //
+    // The callback runs in the copy that was already running, so the second
+    // launch reads to the cashier as "the window opened", which is what they
+    // wanted when they double-clicked. Meanwhile the plugin exits the new
+    // process before it can print anything.
+    //
+    // This net does not cover a build that runs outside Tauri (a test, a
+    // support harness, `cargo run` next to an installed copy); the exclusive
+    // lock on the print ledger does, and it is the one the relay checks.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        tracing::warn!(
+            ?argv,
+            cwd,
+            "a second instance tried to start; showing the one already running instead"
+        );
+        tray::show_main_window(app);
+    }));
+
+    builder
         // opener: lets the tray menu open files / URLs without spawning shell commands.
         .plugin(tauri_plugin_opener::init())
         // autostart: HKCU\...\Run on Windows (no-op flag for macOS — not in scope yet).
@@ -100,6 +215,11 @@ pub fn run() {
             test_print,
             set_autostart,
             is_autostart_enabled,
+            pair_station,
+            unpair_station,
+            relay_status,
+            local_secret,
+            set_default_printer,
         ])
         // Close-to-tray: clicking the window's X must NOT quit the
         // bridge — that would silently kill printing for the whole POS.
@@ -113,12 +233,74 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Settings first: both the local server and the relay read from
+            // this one store, and the local secret is generated here if the
+            // install has never had one.
+            let settings = config::SettingsStore::load();
+            app.manage(settings.clone());
+
             // Install the system tray icon. Failure here is recoverable
             // (the WSS still works), but log loudly so a regression is
             // obvious in a support log.
             if let Err(e) = tray::install(app.handle()) {
                 tracing::error!("failed to install tray icon: {e}");
             }
+
+            // Outbound relay. Started even when the bridge is not paired yet:
+            // it parks itself and wakes up the moment a code is redeemed, so
+            // pairing needs no restart at the till.
+            //
+            // # `spawn_on`, never `spawn`, from here
+            //
+            // `relay::spawn` ends in `tokio::spawn`, and **this hook does not
+            // run inside the async runtime** — Tauri calls `setup` from
+            // `Builder::build`, on the main thread. Calling it directly panics
+            // with *"there is no reactor running"* and takes the whole app down
+            // before the window ever appears.
+            //
+            // It is not a hypothetical: the app on `feat/relay` exited 101 on
+            // every launch, verified on a build of a47a19c itself. The feature
+            // had only ever been exercised from `#[tokio::test]`, where a
+            // runtime is already entered, so the relay tests were all green
+            // while the shipping binary could not start — and they stayed green
+            // when the guard was reverted to check, which is why the guard now
+            // lives in a named function with tests of its own. The one that
+            // still bites if this line changes is `tests/app_smoke.rs`: it runs
+            // the built binary and asks it whether it is serving.
+            let runtime = tauri::async_runtime::handle();
+            let relay = relay::spawn_on(runtime.inner(), settings.clone());
+            if settings.snapshot().is_paired() {
+                tracing::info!("relay: station already paired, connecting");
+            } else {
+                tracing::info!("relay: no station paired yet — pair from Ajustes → Estación");
+            }
+
+            // Keep the tray tooltip honest about the relay.
+            //
+            // The icon by the clock is all most tills ever show, and a bridge
+            // that has stood down — because a second copy holds the print
+            // ledger — looks exactly like one that is printing. Someone has to
+            // be able to find that out without opening a window.
+            let tray_app = app.handle().clone();
+            let watched = relay.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut shown: Option<String> = None;
+                loop {
+                    let tip = tray::tooltip_for(&watched.status());
+                    if shown.as_deref() != Some(tip.as_str()) {
+                        tray::set_tooltip(&tray_app, &tip);
+                        shown = Some(tip);
+                    }
+                    tokio::time::sleep(TRAY_TOOLTIP_TICK).await;
+                }
+            });
+
+            // The local server answers `/health`, which the POS polls to decide
+            // whether this till has a working bridge. Handing it the relay is
+            // what lets that answer mention the half of the bridge the POS
+            // cannot see — see the `server` module header.
+            let server_relay = relay.clone();
+            app.manage(relay);
 
             // Spawn the server on Tauri's runtime so it shuts down cleanly
             // when the app exits.
@@ -129,10 +311,13 @@ pub fn run() {
             // bridge, with no rebuild and no new MSI. The embedded pair stays
             // as the safety net — see `tls_material` for why that ordering,
             // and for what happens when the file on disk is corrupt.
+            let server_settings = settings;
             tauri::async_runtime::spawn(async move {
                 let tls = tls_material::resolve(CERT_PEM, KEY_PEM);
                 tracing::info!(source = tls.source, "TLS material resolved");
-                if let Err(e) = server::serve(&tls.cert, &tls.key).await {
+                if let Err(e) =
+                    server::serve(&tls.cert, &tls.key, server_settings, Some(server_relay)).await
+                {
                     tracing::error!("server exited: {e}");
                 }
             });

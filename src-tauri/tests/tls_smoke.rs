@@ -26,8 +26,24 @@ async fn tls_health_returns_200_with_real_cert() {
     let key =
         std::fs::read("certs/privkey.pem").expect("certs/privkey.pem must exist for smoke test");
 
+    // In-memory settings so the smoke test never reads or writes the real
+    // `%PROGRAMDATA%\GourmelyPrint\config.json` of the machine running it.
+    // `LocalAuth::Off` because what is under test here is TLS, not the guard —
+    // the guard has its own tests in `server.rs`.
+    let settings =
+        print_bridge_lib::config::SettingsStore::in_memory(print_bridge_lib::config::Settings {
+            local_auth: print_bridge_lib::config::LocalAuth::Off,
+            ..Default::default()
+        });
+
+    // No relay: this test is about the TLS path. `/health` reports the relay as
+    // `unknown` in that case, which the assertions below check — an "unknown"
+    // that quietly read as healthy would be the exact bug `relay` was added to
+    // stop.
     let server_task =
-        tokio::spawn(async move { print_bridge_lib::server::serve(&cert, &key).await });
+        tokio::spawn(
+            async move { print_bridge_lib::server::serve(&cert, &key, settings, None).await },
+        );
 
     // Tiny pause for the listener to be ready. axum_server is fast; 1s
     // is generous but reliable on CI runners with cold caches.
@@ -49,6 +65,11 @@ async fn tls_health_returns_200_with_real_cert() {
     assert_eq!(body["ok"], true);
     assert!(body["version"].is_string());
     assert!(body["uptime_seconds"].is_number());
+    assert_eq!(body["relay"]["state"], "unknown");
+    assert_eq!(
+        body["relay"]["ok"], false,
+        "a bridge with no relay must not report the remote path as usable"
+    );
 
     println!("/health body: {}", body);
 

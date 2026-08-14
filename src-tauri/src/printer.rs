@@ -8,10 +8,31 @@
 //! spooler-side translation, the bytes hit the wire exactly as we
 //! emit them, which is what ESC/POS requires.
 
+use std::path::PathBuf;
+
 use crate::error::{BridgeError, BridgeResult};
 use printers::common::base::job::PrinterJobOptions;
 use printers::common::base::printer::Printer;
 use printers::common::converters::Converter;
+
+/// Env var that redirects every print job to a file instead of the spooler.
+///
+/// This is the QA and support hatch, and it earns its place: the relay has to
+/// be provable end to end — pair, connect, receive, print, ack — and a CI
+/// runner has no thermal printer, nor does the machine of whoever is debugging
+/// a customer's ticket at two in the morning. Writing the ESC/POS bytes to a
+/// file exercises the same path the spooler does, up to the spooler itself.
+///
+/// Off unless the variable is set, and every job logs a warning saying where
+/// the paper went — an install that silently swallowed tickets into a folder
+/// would be indistinguishable from a printer that works.
+const SINK_ENV: &str = "GOURMELYPRINT_SINK_DIR";
+
+fn sink_dir() -> Option<PathBuf> {
+    std::env::var_os(SINK_ENV)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
 
 /// Returns the printable names of every printer registered on this
 /// machine.
@@ -23,6 +44,9 @@ pub fn list() -> BridgeResult<Vec<String>> {
 /// Sends `bytes` to `printer_name` as a RAW print job. Returns the print
 /// job id (or 0 if the underlying API doesn't expose one).
 pub fn print_raw(printer_name: &str, bytes: &[u8]) -> BridgeResult<u32> {
+    if let Some(dir) = sink_dir() {
+        return print_to_sink(&dir, printer_name, bytes);
+    }
     let printer = find_printer(printer_name)?;
     // RAW (no-conversion) datatype is what ESC/POS thermal printers need;
     // the spooler must pass bytes through untouched.
@@ -44,6 +68,51 @@ fn find_printer(name: &str) -> BridgeResult<Printer> {
         .into_iter()
         .find(|p| p.name == name)
         .ok_or_else(|| BridgeError::PrinterNotFound(name.to_string()))
+}
+
+/// Writes the raw ESC/POS bytes to
+/// `<dir>/<printer>-<timestamp>-<pid>-<seq>.escpos`.
+///
+/// The bytes land untouched, so the file can be piped at a real printer later
+/// (`copy /b file \\host\printer`) or read with a hex viewer to check that the
+/// cut command and the logo raster survived the round trip.
+///
+/// # Why the name carries the pid and a counter
+///
+/// The name used to be printer + milliseconds, and everything that counts
+/// duplicates counts *files*. Two bridges printing the same job react to the
+/// same socket frame and land inside the same millisecond routinely, so the
+/// second write overwrote the first and **two tickets showed up as one** — the
+/// duplicate would have been invisible to the very test written to catch it.
+/// The pid separates two processes, the counter separates two jobs in one.
+fn print_to_sink(dir: &PathBuf, printer_name: &str, bytes: &[u8]) -> BridgeResult<u32> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(dir)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let safe: String = printer_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = dir.join(format!(
+        "{safe}-{stamp}-{}-{}.escpos",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes)?;
+    tracing::warn!(
+        path = %path.display(),
+        printer = printer_name,
+        bytes = bytes.len(),
+        "{SINK_ENV} is set: the job went to a FILE, not to the printer"
+    );
+    Ok(0)
 }
 
 /// Canonical ESC/POS test ticket — used by both the tray menu and the

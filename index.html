@@ -19,6 +19,7 @@
 
     <nav class="tabs" role="tablist">
       <button class="tab is-active" data-tab="status" role="tab">Estado</button>
+      <button class="tab" data-tab="station" role="tab">Estación</button>
       <button class="tab" data-tab="printers" role="tab">Impresoras</button>
       <button class="tab" data-tab="settings" role="tab">Ajustes</button>
     </nav>
@@ -49,6 +50,81 @@
           Este servicio debe estar abierto mientras uses el POS. Se conecta al
           navegador vía <code>wss://localhost.gourmelyhub.busticco.com:8181</code>.
         </p>
+      </section>
+
+      <!-- ────── Estación ────── -->
+      <section class="panel" data-panel="station">
+        <h2>Impresión remota</h2>
+        <p class="hint">
+          Vincula esta caja con tu negocio para que las comandas lleguen desde
+          cualquier red — un mesero en la calle manda el pedido y sale aquí.
+          El código lo genera el dueño en
+          <em>GourmelyHub → Configuración → Impresión → Estaciones</em>.
+        </p>
+
+        <div class="status-grid">
+          <div class="status-card">
+            <span class="status-label">Estado</span>
+            <span class="status-value" id="relay-state">—</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Estación</span>
+            <span class="status-value" id="relay-label">—</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Impresos</span>
+            <span class="status-value" id="relay-printed">0</span>
+          </div>
+          <div class="status-card">
+            <span class="status-label">Fallidos</span>
+            <span class="status-value" id="relay-failed">0</span>
+          </div>
+        </div>
+
+        <p class="hint" id="relay-error" hidden></p>
+
+        <div class="setting-row" id="pair-form">
+          <label class="setting-label" for="pair-code">
+            <span>Código de vinculación</span>
+            <span class="setting-help">
+              Ocho caracteres, como <code>FJTX-35AH</code>. Vale una sola vez y
+              caduca a los 10 minutos.
+            </span>
+          </label>
+          <input
+            type="text"
+            id="pair-code"
+            class="pair-input"
+            placeholder="FJTX-35AH"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="20"
+          />
+        </div>
+
+        <div class="setting-row">
+          <label class="setting-label" for="server-url">
+            <span>Servidor</span>
+            <span class="setting-help">
+              Solo cámbialo si soporte te lo pide.
+            </span>
+          </label>
+          <input type="text" id="server-url" class="pair-input" autocomplete="off" spellcheck="false" />
+        </div>
+
+        <div class="pair-actions">
+          <button class="btn-primary" id="pair-submit">Vincular estación</button>
+          <button class="btn-ghost" id="pair-forget" hidden>Desvincular esta caja</button>
+        </div>
+
+        <details class="local-secret">
+          <summary>Token local del POS (avanzado)</summary>
+          <p class="hint">
+            Secreto que el navegador tendrá que presentar cuando se active el
+            modo estricto. Hoy no hace falta: el POS entra por su origen.
+          </p>
+          <code class="secret-value" id="local-secret">—</code>
+        </details>
       </section>
 
       <!-- ────── Impresoras ────── -->

@@ -40,6 +40,10 @@ thiserror = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# CSPRNG for the local WSS secret. Explicit dependency rather than borrowing
+# `uuid`'s: this value is a bearer credential and the source of its entropy
+# should be visible in the manifest.
+getrandom = "0.4"
 
 # Async runtime + HTTP server
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "signal", "fs"] }
@@ -47,6 +51,26 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
+
+# Outbound relay to GourmelyHub.
+#
+# A raw WebSocket, with Engine.IO v4 / Socket.IO v5 spoken by hand in
+# `src/engineio.rs`. `rust_socketio` 0.6 was tried first against the real API
+# and is unusable here: it emits queued events immediately after the CONNECT
+# packet, without waiting for the namespace ack, and Socket.IO's server closes
+# the whole client when an event names a namespace it has not finished joining.
+# The `/print` middleware awaits a database lookup, so that race is lost every
+# time — four attempts, four silent failures. Worse, its `connect()` returns Ok
+# before any ack, so a revoked token also looks like a healthy connection. The
+# full capture and the controlled experiment are in `engineio.rs`.
+#
+# rustls, matching the TLS stack already in the binary, so there is one story
+# for certificates on Windows instead of two.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# Redeeming the pairing code — one POST. rustls rather than the system TLS so
+# the bridge keeps one TLS stack story on Windows.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # TLS — explicit aws-lc-rs feature picks the FIPS-friendly crypto provider.
 # rustls 0.23 dropped the implicit default; if you don't pick one here the
@@ -63,9 +87,29 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # code stays simple and cross-platform-friendly.
 printers = "2"
 
+# One bridge per machine, enforced before anything else boots.
+#
+# Until the relay, a second copy was harmless by accident: it could not take
+# port 8181 and sat there inert. An outbound socket needs no port to fight over,
+# so the second copy now authenticates with the same station token, joins the
+# same room, and the server pushes every job down both sockets — one order, two
+# comandas. The trigger is routine: the X hides the window to the tray,
+# autostart already launched one at login, and the cashier double-clicks the
+# shortcut because nothing looks open.
+#
+# This is the outer net (the second one is the ledger lock in
+# `src/instance_lock.rs`, which also covers the case where the process is not
+# running under Tauri at all). Desktop only — the plugin has no mobile
+# implementation, and `cfg(desktop)` in `lib.rs` gates the call to match.
+#
+# This header must come after every entry of `[dependencies]`: a `[target.…]`
+# table ends the one above it, so a crate added below would silently stop being
+# a dependency of every platform.
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
+
 [dev-dependencies]
 axum-test = "16"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [profile.release]
 opt-level = 3
