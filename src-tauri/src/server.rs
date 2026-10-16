@@ -77,6 +77,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -90,6 +91,7 @@ use crate::{
 
 /// Process-wide server state. Shared (Arc) across all axum handlers.
 pub type PrintRawFn = dyn Fn(&str, &[u8]) -> BridgeResult<u32> + Send + Sync;
+const MAX_ACTIVE_LOCAL_PRINTS: usize = 4;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -103,6 +105,7 @@ pub struct ServerState {
     /// Available only when durable local intent storage opened successfully.
     pub local_ledger: Option<Arc<LocalJobLedger>>,
     pub print_raw: Arc<PrintRawFn>,
+    pub print_slots: Arc<Semaphore>,
 }
 
 /// `?token=…` on the upgrade URL.
@@ -492,31 +495,47 @@ async fn handle_text(text: &str, state: &ServerState) -> WsResponse {
                     format!("payload {} > max {}", bytes.len(), MAX_PRINT_BYTES),
                 );
             }
-            if let Some(intent_id) = print_intent_id {
-                return print_with_intent(state, id, name, &bytes, intent_id);
-            }
-            match (state.print_raw)(&name, &bytes) {
-                Ok(job_id) => WsResponse::PrintOk {
-                    id,
-                    ok: true,
-                    job_id,
-                    print_intent_id: None,
-                },
-                Err(e) => WsResponse::err(id, e.to_string()),
-            }
+            run_print(state, id, name, bytes, print_intent_id).await
         }
         WsRequest::Test { id, printer: name } => {
             let bytes = printer::test_ticket_bytes();
-            match (state.print_raw)(&name, &bytes) {
-                Ok(job_id) => WsResponse::PrintOk {
-                    id,
-                    ok: true,
-                    job_id,
-                    print_intent_id: None,
-                },
-                Err(e) => WsResponse::err(id, e.to_string()),
-            }
+            run_print(state, id, name, bytes, None).await
         }
+    }
+}
+
+async fn run_print(
+    state: &ServerState,
+    id: String,
+    printer_name: String,
+    bytes: Vec<u8>,
+    intent_id: Option<String>,
+) -> WsResponse {
+    let permit = match Arc::clone(&state.print_slots).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return WsResponse::err(id, format!("local print pool closed: {error}")),
+    };
+    let state = state.clone();
+    let fallback_id = id.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Some(intent_id) = intent_id {
+            return print_with_intent(&state, id, printer_name, &bytes, intent_id);
+        }
+        match (state.print_raw)(&printer_name, &bytes) {
+            Ok(job_id) => WsResponse::PrintOk {
+                id,
+                ok: true,
+                job_id,
+                print_intent_id: None,
+            },
+            Err(error) => WsResponse::err(id, error.to_string()),
+        }
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => WsResponse::err(fallback_id, format!("local print task failed: {error}")),
     }
 }
 
@@ -618,6 +637,7 @@ pub async fn serve(
             crate::config::data_dir().map(|dir| dir.join("local-print-intents.jsonl")),
         ),
         print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     };
     tracing::info!(
         mode = ?state.settings.snapshot().local_auth,
@@ -663,6 +683,7 @@ pub fn router_with_settings(settings: crate::config::Settings) -> Router {
         relay: None,
         local_ledger: None,
         print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
 }
 
@@ -680,6 +701,7 @@ pub fn router_with_relay(relay: RelayHandle) -> Router {
         relay: Some(relay),
         local_ledger: None,
         print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
 }
 
@@ -749,6 +771,7 @@ mod tests {
             relay: None,
             local_ledger: ledger,
             print_raw: fake.clone(),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         };
 
         let first_ledger = Arc::new(crate::local_job_ledger::LocalJobLedger::open(&path).unwrap());
@@ -876,6 +899,104 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_local_spooler_does_not_delay_health_or_another_socket() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        for mode in ["legacy", "intent", "test"] {
+            let entered = Arc::new(AtomicBool::new(false));
+            let fake = {
+                let entered = Arc::clone(&entered);
+                Arc::new(move |_printer: &str, _bytes: &[u8]| {
+                    entered.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(91)
+                })
+            };
+            let ledger = if mode == "intent" {
+                let path = std::env::temp_dir()
+                    .join(format!("bridge-blocked-spooler-{}", uuid::Uuid::new_v4()))
+                    .join("local-print-intents.jsonl");
+                Some(Arc::new(LocalJobLedger::open(path).unwrap()))
+            } else {
+                None
+            };
+            let state = ServerState {
+                started_at: Instant::now(),
+                version: "test",
+                settings: SettingsStore::in_memory(Settings {
+                    local_auth: LocalAuth::Off,
+                    ..Default::default()
+                }),
+                relay: None,
+                local_ledger: ledger,
+                print_raw: fake,
+                print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+            };
+            let (server, url) = ws_test_server(state).await;
+            let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let health_url = url.replace("ws://", "http://").replace("/print", "/health");
+            let watcher_url = url.clone();
+            let watcher = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !entered.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "spooler never started");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let started = Instant::now();
+                    let health: serde_json::Value = reqwest::get(health_url)
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let (mut second, _) = tokio_tungstenite::connect_async(&watcher_url)
+                        .await
+                        .unwrap();
+                    let list = ws_exchange(
+                        &mut second,
+                        serde_json::json!({"op":"list","id":"another-socket"}),
+                    )
+                    .await;
+                    (started.elapsed(), health, list)
+                })
+            });
+            let request = match mode {
+                "intent" => serde_json::json!({
+                    "op":"print", "id":"blocked", "printer":"Fake",
+                    "data":BASE64.encode(b"ticket"), "printIntentId":"blocked-intent"
+                }),
+                "test" => serde_json::json!({"op":"test","id":"blocked","printer":"Fake"}),
+                _ => serde_json::json!({
+                    "op":"print", "id":"blocked", "printer":"Fake",
+                    "data":BASE64.encode(b"ticket")
+                }),
+            };
+            let printing = tokio::spawn(async move { ws_exchange(&mut first, request).await });
+            tokio::task::yield_now().await;
+            let (elapsed, health, list) =
+                tokio::task::spawn_blocking(move || watcher.join().unwrap())
+                    .await
+                    .unwrap();
+            assert_eq!(health["ok"], true, "{mode}");
+            assert_eq!(list["ok"], true, "{mode}");
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{mode} blocked other requests for {elapsed:?}"
+            );
+            let printed = printing.await.unwrap();
+            assert_eq!(printed["ok"], true, "{mode}");
+            assert_eq!(printed["jobId"], 91, "{mode}");
+            server.abort();
+        }
+    }
+
     fn headers(origin: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
         if let Some(o) = origin {
@@ -899,6 +1020,7 @@ mod tests {
             relay: None,
             local_ledger: None,
             print_raw: Arc::new(printer::print_raw),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         }
     }
 
