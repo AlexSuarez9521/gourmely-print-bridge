@@ -237,28 +237,40 @@ fn generate_secret() -> BridgeResult<String> {
     Ok(BASE64URL.encode(bytes))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigReadIssue {
+    Malformed,
+    Unreadable,
+}
+
+#[cfg(windows)]
+const ACL_REPAIR_ACTION: &str = "La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.";
+
+#[cfg(windows)]
+const MALFORMED_CONFIG_ACTION: &str = "config.json está dañado: detén GourmelyPrint Bridge, haz un respaldo seguro del archivo y restaura una copia válida o renómbralo; luego reinicia y vuelve a emparejar la estación.";
+
 /// Reads the settings file, tolerating every way it can be absent or broken.
 ///
 /// A corrupt file must never stop the bridge from booting: the till would lose
 /// printing over a JSON typo. It falls back to defaults and logs loudly, the
 /// same posture as `tls_material`.
-fn load_from_disk() -> (Settings, bool) {
+fn load_from_disk() -> (Settings, Option<ConfigReadIssue>) {
     let Some(path) = settings_path() else {
         tracing::warn!("no data directory resolvable; running with in-memory settings");
-        return (Settings::default(), false);
+        return (Settings::default(), None);
     };
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-            Ok(s) => (s, false),
+            Ok(s) => (s, None),
             Err(e) => {
                 tracing::error!(path = %path.display(), err = %e, "config.json does not parse; starting from defaults");
-                (Settings::default(), true)
+                (Settings::default(), Some(ConfigReadIssue::Malformed))
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
         Err(e) => {
             tracing::error!(path = %path.display(), err = %e, "config.json unreadable; starting from defaults");
-            (Settings::default(), true)
+            (Settings::default(), Some(ConfigReadIssue::Unreadable))
         }
     }
 }
@@ -351,13 +363,15 @@ impl SettingsStore {
 
     #[cfg(windows)]
     fn load_with_acl(acl: std::io::Result<String>) -> Self {
-        let (settings, unreadable) = load_from_disk();
+        let (settings, read_issue) = load_from_disk();
         let acl_error = acl.as_ref().err().map(|e| e.to_string());
         let acl_user_sid = acl.ok();
-        let security_issue = if unreadable || acl_error.is_some() {
-            Some("La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.".to_string())
-        } else {
-            None
+        let security_issue = match (acl_error.is_some(), read_issue) {
+            (true, _) | (_, Some(ConfigReadIssue::Unreadable)) => {
+                Some(ACL_REPAIR_ACTION.to_string())
+            }
+            (false, Some(ConfigReadIssue::Malformed)) => Some(MALFORMED_CONFIG_ACTION.to_string()),
+            (false, None) => None,
         };
         if let Some(error) = acl_error {
             tracing::error!(%error, "Windows credential ACL migration failed; preserving existing files read-only");
@@ -394,7 +408,7 @@ impl SettingsStore {
                             tracing::error!(err = %e, "could not persist the generated local secret");
                             #[cfg(windows)]
                             {
-                                security_issue = Some("La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.".to_string());
+                                security_issue = Some(ACL_REPAIR_ACTION.to_string());
                             }
                         }
                     }
