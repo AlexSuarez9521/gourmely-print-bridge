@@ -149,6 +149,8 @@ cargo test --test relay_e2e -- --ignored --nocapture
 UI security tests run against Vite with mocked Tauri IPC and the configured
 production CSP as a browser response header. They need no model key, backend,
 or printer; they do not replace a packaged WebView/MSI smoke test.
+CI runs the browser tests on Ubuntu (the e2e runner documents Windows via WSL)
+and the version/CSP static checks alongside Rust checks on Windows.
 
 ```bash
 npm run test:e2e
