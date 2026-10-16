@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{Mutex, MutexGuard},
 };
@@ -57,16 +57,25 @@ pub struct LocalJobLedger {
 
 impl LocalJobLedger {
     pub fn open(path: impl AsRef<Path>) -> BridgeResult<Self> {
+        Self::open_with_sync(path, sync_parent)
+    }
+
+    fn open_with_sync(
+        path: impl AsRef<Path>,
+        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> BridgeResult<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let lock = InstanceLock::acquire(path.with_extension("lock"))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)?;
+        let (mut file, _) = open_file(path)?;
+        // A Fresh claim must never precede durable creation of its ledger name.
+        // Re-sync on every open so a previous failed sync cannot be bypassed.
+        file.sync_all()?;
+        sync_parent(parent)?;
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -166,6 +175,45 @@ impl LocalJobLedger {
     }
 }
 
+fn open_file(path: &Path) -> io::Result<(File, bool)> {
+    let mut create = OpenOptions::new();
+    create.read(true).append(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // CreateFileW FILE_FLAG_WRITE_THROUGH flushes NTFS metadata changes.
+        // The later sync_all maps to FlushFileBuffers, including file metadata.
+        // See Microsoft Learn: CreateFileW and File Caching.
+        create.custom_flags(0x8000_0000);
+    }
+    match create.open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = OpenOptions::new();
+            existing.read(true).append(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                existing.custom_flags(0x8000_0000);
+            }
+            Ok((existing.open(path)?, false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent(_parent: &Path) -> io::Result<()> {
+    // Windows has no portable directory fsync. The write-through file handle
+    // plus sync_all above is the documented file-and-metadata flush path.
+    Ok(())
+}
+
 fn append(inner: &mut Inner, record: &Record) -> BridgeResult<()> {
     if inner.blocked {
         return Err(BridgeError::Config(
@@ -189,17 +237,64 @@ fn append(inner: &mut Inner, record: &Record) -> BridgeResult<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         path::PathBuf,
         sync::{Arc, Barrier},
     };
 
-    use super::{Claim, LocalJobLedger, Outcome};
+    use super::{open_file, Claim, LocalJobLedger, Outcome};
 
     fn ledger_path() -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("bridge-local-ledger-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("test directory");
         dir.join("local-print-intents.jsonl")
+    }
+
+    #[test]
+    fn ledger_open_requires_parent_sync_before_it_can_accept_claims() {
+        let path = ledger_path();
+        let parent = path.parent().unwrap().to_path_buf();
+        let mut synced = false;
+        let ledger = LocalJobLedger::open_with_sync(&path, |candidate| {
+            assert_eq!(candidate, parent);
+            synced = true;
+            Ok(())
+        })
+        .expect("open after parent sync");
+        assert!(synced);
+        drop(ledger);
+
+        let before = std::fs::read(&path).expect("read ledger");
+        assert!(
+            LocalJobLedger::open_with_sync(&path, |_| Err(io::Error::other("sync failed")))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).expect("read after refusal"), before);
+    }
+
+    #[test]
+    fn initial_file_creation_has_exactly_one_winner() {
+        let path = ledger_path();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (_file, created) = open_file(&path).expect("open ledger file");
+                    created
+                })
+            })
+            .collect();
+        let created = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker"))
+            .filter(|created| *created)
+            .count();
+        assert_eq!(created, 1);
+        assert!(path.is_file());
     }
 
     #[test]
