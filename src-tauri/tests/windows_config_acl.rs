@@ -55,7 +55,7 @@ fn grant_legacy_users_read(path: &Path, inherited: bool) {
 
 fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
     let sddl = powershell(
-        "(Get-Acl -LiteralPath $env:GOURMELYPRINT_ACL_TEST_PATH).Sddl",
+        "if ([System.IO.Directory]::Exists($env:GOURMELYPRINT_ACL_TEST_PATH)) { $acl = [System.IO.Directory]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH) } else { $acl = [System.IO.File]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH) }; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)",
         path,
     );
     if protected {
