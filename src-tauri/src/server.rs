@@ -210,6 +210,8 @@ struct HealthResponse {
     uptime_seconds: u64,
     printer_count: usize,
     relay: HealthRelay,
+    /// A failed Windows credential migration never silently looks healthy.
+    configuration_security: Option<String>,
 }
 
 /// The relay, as `/health` reports it.
@@ -392,6 +394,7 @@ async fn health_handler(State(s): State<ServerState>) -> Json<HealthResponse> {
         uptime_seconds: s.started_at.elapsed().as_secs(),
         printer_count,
         relay: HealthRelay::of(s.relay.as_ref()),
+        configuration_security: s.settings.security_issue().map(str::to_owned),
     })
 }
 

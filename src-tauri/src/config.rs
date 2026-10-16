@@ -9,7 +9,8 @@
 //! to, the station token it got when it was paired, the secret the local POS
 //! must present — lives in `%PROGRAMDATA%\GourmelyPrint\config.json`, next to
 //! the certs and for the same reason: machine-wide (one bridge serves every
-//! Windows account on the till) and writable without fighting UAC.
+//! Windows account on the till) and protected for the active cashier, SYSTEM,
+//! and Administrators. Existing installs that cannot be repaired stay readable.
 //!
 //! The origin allowlist below is still compile-time. Moving it to the settings
 //! file — so support can point one install at a staging origin without a
@@ -241,36 +242,45 @@ fn generate_secret() -> BridgeResult<String> {
 /// A corrupt file must never stop the bridge from booting: the till would lose
 /// printing over a JSON typo. It falls back to defaults and logs loudly, the
 /// same posture as `tls_material`.
-fn load_from_disk() -> Settings {
+fn load_from_disk() -> (Settings, bool) {
     let Some(path) = settings_path() else {
         tracing::warn!("no data directory resolvable; running with in-memory settings");
-        return Settings::default();
+        return (Settings::default(), false);
     };
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-            Ok(s) => s,
+            Ok(s) => (s, false),
             Err(e) => {
                 tracing::error!(path = %path.display(), err = %e, "config.json does not parse; starting from defaults");
-                Settings::default()
+                (Settings::default(), true)
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), false),
         Err(e) => {
             tracing::error!(path = %path.display(), err = %e, "config.json unreadable; starting from defaults");
-            Settings::default()
+            (Settings::default(), true)
         }
     }
 }
 
 /// Writes the settings atomically: a half-written `config.json` would take the
 /// station token with it and the till would silently stop printing remotely.
-fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
+fn save_to_disk(settings: &Settings, acl_user_sid: Option<&str>) -> BridgeResult<()> {
     let Some(path) = settings_path() else {
         return Err(BridgeError::Config(
             "no hay carpeta de datos donde guardar la configuración".into(),
         ));
     };
     if let Some(parent) = path.parent() {
+        #[cfg(windows)]
+        {
+            let sid = acl_user_sid.ok_or_else(|| {
+                BridgeError::Config("config security repair requires an interactive user".into())
+            })?;
+            crate::windows_acl::protect_data_dir_for_user(parent, sid)?;
+        }
+        #[cfg(not(windows))]
+        let _ = acl_user_sid;
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_vec_pretty(settings)
@@ -279,6 +289,11 @@ fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
     let tmp = path.with_extension("json.tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
+        #[cfg(windows)]
+        crate::windows_acl::protect_file_for_user(
+            &tmp,
+            acl_user_sid.expect("preflight required a Windows SID"),
+        )?;
         file.write_all(&body)?;
         file.sync_all()?;
     }
@@ -295,6 +310,9 @@ fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
 pub struct SettingsStore {
     inner: Arc<RwLock<Settings>>,
     persist: bool,
+    security_issue: Option<String>,
+    #[cfg(windows)]
+    acl_user_sid: Option<String>,
 }
 
 impl SettingsStore {
@@ -304,16 +322,79 @@ impl SettingsStore {
     /// secure default real: an install that has never been configured still
     /// comes up with a secret ready for the web to present.
     pub fn load() -> Self {
-        let mut settings = load_from_disk();
+        #[cfg(windows)]
+        let acl = {
+            // CI has no cashier session. The override is compiled out of
+            // release builds and only applies to an isolated data directory.
+            #[cfg(debug_assertions)]
+            let fixture_sid = std::env::var("GOURMELYPRINT_ACL_TEST_SID")
+                .ok()
+                .filter(|_| std::env::var_os("GOURMELYPRINT_DATA_DIR").is_some());
+            #[cfg(not(debug_assertions))]
+            let fixture_sid: Option<String> = None;
+            fixture_sid
+                .map(Ok)
+                .unwrap_or_else(crate::windows_acl::interactive_user_sid)
+        }
+        .and_then(|sid| {
+            let dir = data_dir().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "data directory unavailable")
+            })?;
+            crate::windows_acl::protect_data_dir_for_user(&dir, &sid)?;
+            Ok(sid)
+        });
+        #[cfg(windows)]
+        return Self::load_with_acl(acl);
+        #[cfg(not(windows))]
+        Self::load_with_acl(())
+    }
+
+    #[cfg(windows)]
+    fn load_with_acl(acl: std::io::Result<String>) -> Self {
+        let (settings, unreadable) = load_from_disk();
+        let acl_error = acl.as_ref().err().map(|e| e.to_string());
+        let acl_user_sid = acl.ok();
+        let security_issue = if unreadable || acl_error.is_some() {
+            Some("Configuration security needs repair: run the repair as administrator, then restart the bridge.".to_string())
+        } else {
+            None
+        };
+        if let Some(error) = acl_error {
+            tracing::error!(%error, "Windows credential ACL migration failed; preserving existing files read-only");
+        }
+        Self::finish_load(settings, security_issue, acl_user_sid)
+    }
+
+    #[cfg(not(windows))]
+    fn load_with_acl(_: ()) -> Self {
+        let (settings, unreadable) = load_from_disk();
+        let issue = unreadable.then(|| {
+            "Configuration is unreadable; repair the file and restart the bridge.".to_string()
+        });
+        Self::finish_load(settings, issue)
+    }
+
+    fn finish_load(
+        mut settings: Settings,
+        mut security_issue: Option<String>,
+        #[cfg(windows)] acl_user_sid: Option<String>,
+    ) -> Self {
         if settings.local_secret.is_none() {
             match generate_secret() {
                 Ok(secret) => {
                     settings.local_secret = Some(secret);
-                    if let Err(e) = save_to_disk(&settings) {
-                        // Not fatal: the bridge runs with an in-memory secret
-                        // and the POS keeps printing through the origin check.
-                        // It just has to be re-issued on the next boot.
-                        tracing::error!(err = %e, "could not persist the generated local secret");
+                    if security_issue.is_none() {
+                        #[cfg(windows)]
+                        let sid = acl_user_sid.as_deref();
+                        #[cfg(not(windows))]
+                        let sid = None;
+                        if let Err(e) = save_to_disk(&settings, sid) {
+                            // Not fatal: the bridge runs with an in-memory secret
+                            // and the POS keeps printing through the origin check.
+                            // It just has to be re-issued on the next boot.
+                            tracing::error!(err = %e, "could not persist the generated local secret");
+                            security_issue = Some("Configuration security needs repair: run the repair as administrator, then restart the bridge.".to_string());
+                        }
                     }
                 }
                 Err(e) => tracing::error!(err = %e, "could not generate the local secret"),
@@ -322,6 +403,9 @@ impl SettingsStore {
         Self {
             inner: Arc::new(RwLock::new(settings)),
             persist: true,
+            security_issue,
+            #[cfg(windows)]
+            acl_user_sid,
         }
     }
 
@@ -335,7 +419,14 @@ impl SettingsStore {
         Self {
             inner: Arc::new(RwLock::new(settings)),
             persist: false,
+            security_issue: None,
+            #[cfg(windows)]
+            acl_user_sid: None,
         }
+    }
+
+    pub fn security_issue(&self) -> Option<&str> {
+        self.security_issue.as_deref()
     }
 
     /// A snapshot. Callers get a clone rather than a guard so a slow consumer
@@ -359,8 +450,15 @@ impl SettingsStore {
         };
         let mut next = guard.clone();
         f(&mut next);
+        if let Some(issue) = &self.security_issue {
+            return Err(BridgeError::Config(issue.clone()));
+        }
         if self.persist {
-            save_to_disk(&next)?;
+            #[cfg(windows)]
+            let sid = self.acl_user_sid.as_deref();
+            #[cfg(not(windows))]
+            let sid = None;
+            save_to_disk(&next, sid)?;
         }
         *guard = next.clone();
         Ok(next)
