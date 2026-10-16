@@ -170,7 +170,10 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
             .contains("respaldo"),
         "a malformed config needs a backup/restore instruction, not only elevation"
     );
-    assert!(fallback.security_issue().unwrap_or_default().contains("emparejar"));
+    assert!(fallback
+        .security_issue()
+        .unwrap_or_default()
+        .contains("emparejar"));
     assert!(fallback
         .update(|s| s.label = Some("Unsafe".into()))
         .is_err());
