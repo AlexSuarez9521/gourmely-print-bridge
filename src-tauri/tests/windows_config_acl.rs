@@ -123,7 +123,10 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     assert_private_acl(&config, &user_sid, true);
     for (name, bytes) in sensitive {
         let path = dir.join(name);
-        assert_eq!(fs::read(&path).expect("read existing sensitive file"), bytes);
+        assert_eq!(
+            fs::read(&path).expect("read existing sensitive file"),
+            bytes
+        );
         assert_private_acl(&path, &user_sid, true);
     }
 
@@ -135,7 +138,8 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     fs::write(&temp_probe, b"").expect("create replacement temp file");
     assert_private_acl(&temp_probe, &user_sid, false);
 
-    let damaged = std::env::temp_dir().join(format!("gourmely-acl-damaged-{}", uuid::Uuid::new_v4()));
+    let damaged =
+        std::env::temp_dir().join(format!("gourmely-acl-damaged-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&damaged).expect("create damaged fixture directory");
     let _damaged_sandbox = Sandbox(damaged.clone());
     let damaged_config = damaged.join("config.json");
@@ -144,9 +148,17 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     std::env::set_var("GOURMELYPRINT_DATA_DIR", &damaged);
     let fallback = SettingsStore::load();
     assert!(
-        fallback.security_issue().unwrap_or_default().contains("administrador"),
+        fallback
+            .security_issue()
+            .unwrap_or_default()
+            .contains("administrador"),
         "the operator needs an explicit elevated repair action"
     );
-    assert!(fallback.update(|s| s.label = Some("Unsafe".into())).is_err());
-    assert_eq!(fs::read(damaged_config).expect("read damaged config"), invalid);
+    assert!(fallback
+        .update(|s| s.label = Some("Unsafe".into()))
+        .is_err());
+    assert_eq!(
+        fs::read(damaged_config).expect("read damaged config"),
+        invalid
+    );
 }
