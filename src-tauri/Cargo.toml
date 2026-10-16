@@ -40,6 +40,8 @@ thiserror = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# Collision-resistant identity for local print-intent deduplication.
+sha2 = "=0.10.9"
 # CSPRNG for the local WSS secret. Explicit dependency rather than borrowing
 # `uuid`'s: this value is a bearer credential and the source of its entropy
 # should be visible in the manifest.
