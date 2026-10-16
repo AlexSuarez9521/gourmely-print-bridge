@@ -62,7 +62,7 @@
 //! it is a worse one: a router blip would tell the POS the bridge is missing and
 //! stop the local printing that still works perfectly.
 
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
 use axum::{
     extract::{
@@ -574,6 +574,20 @@ fn print_with_intent(
     }
 }
 
+fn open_local_ledger(path: Option<PathBuf>) -> Option<Arc<LocalJobLedger>> {
+    let Some(path) = path else {
+        tracing::warn!("durable local print intents disabled: no data directory");
+        return None;
+    };
+    match LocalJobLedger::open(path) {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(error) => {
+            tracing::error!(%error, "durable local print intents disabled; legacy printing remains available");
+            None
+        }
+    }
+}
+
 /// Boot the TLS-terminated axum server. Blocks the current task forever
 /// (or until the runtime is dropped). Caller should spawn this in a
 /// dedicated tokio task so the Tauri event loop stays responsive.
@@ -600,10 +614,9 @@ pub async fn serve(
         version: env!("CARGO_PKG_VERSION"),
         settings,
         relay,
-        local_ledger: crate::config::data_dir()
-            .map(|dir| LocalJobLedger::open(dir.join("local-print-intents.jsonl")))
-            .transpose()?
-            .map(Arc::new),
+        local_ledger: open_local_ledger(
+            crate::config::data_dir().map(|dir| dir.join("local-print-intents.jsonl")),
+        ),
         print_raw: Arc::new(printer::print_raw),
     };
     tracing::info!(
@@ -820,7 +833,18 @@ mod tests {
         assert_eq!(*printed.lock().unwrap(), vec![b"\x1b@\xff".to_vec(); 2]);
         server.abort();
 
-        let (server, url) = ws_test_server(make_state(None)).await;
+        // A directory at the ledger path simulates failed startup storage.
+        let unavailable = open_local_ledger(Some(path.parent().unwrap().to_path_buf()));
+        assert!(unavailable.is_none());
+        let (server, url) = ws_test_server(make_state(unavailable)).await;
+        let health_url = url.replace("ws://", "http://").replace("/print", "/health");
+        let health: serde_json::Value = reqwest::get(health_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["ok"], true);
         let (mut socket, _) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("connect legacy-only socket");
@@ -840,6 +864,15 @@ mod tests {
         .await;
         assert_eq!(unsupported["ok"], false);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let legacy = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"legacy-after-ledger-failure", "printer":"Fake", "data":data
+            }),
+        )
+        .await;
+        assert_eq!(legacy["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         server.abort();
     }
 
