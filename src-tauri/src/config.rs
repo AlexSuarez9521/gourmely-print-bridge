@@ -254,6 +254,7 @@ fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
 #[derive(Clone)]
 pub struct SettingsStore {
     inner: Arc<RwLock<Settings>>,
+    persist: bool,
 }
 
 impl SettingsStore {
@@ -280,6 +281,7 @@ impl SettingsStore {
         }
         Self {
             inner: Arc::new(RwLock::new(settings)),
+            persist: true,
         }
     }
 
@@ -292,6 +294,7 @@ impl SettingsStore {
     pub fn in_memory(settings: Settings) -> Self {
         Self {
             inner: Arc::new(RwLock::new(settings)),
+            persist: false,
         }
     }
 
@@ -316,7 +319,9 @@ impl SettingsStore {
         };
         let mut next = guard.clone();
         f(&mut next);
-        save_to_disk(&next)?;
+        if self.persist {
+            save_to_disk(&next)?;
+        }
         *guard = next.clone();
         Ok(next)
     }
@@ -325,6 +330,15 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_store_updates_without_a_data_directory() {
+        let store = SettingsStore::in_memory(Settings::default());
+        store
+            .update(|settings| settings.station_token = Some("station-a".into()))
+            .expect("in-memory update");
+        assert_eq!(store.snapshot().station_token.as_deref(), Some("station-a"));
+    }
 
     #[test]
     fn server_url_falls_back_and_trims() {

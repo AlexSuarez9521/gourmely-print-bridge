@@ -61,7 +61,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{SettingsStore, MAX_PRINT_BYTES};
@@ -295,6 +295,8 @@ pub struct RelayHandle {
     /// Poked when the pairing changes, so the supervisor drops its backoff and
     /// reconnects with the new token instead of waiting it out.
     wake: Arc<Notify>,
+    /// A durable pairing epoch observed by active sockets and queued jobs.
+    pairing: watch::Sender<u64>,
 }
 
 impl RelayHandle {
@@ -322,8 +324,13 @@ impl RelayHandle {
 
     /// Reconnect now: the token changed (paired, re-paired or forgotten).
     pub fn reconnect(&self) {
+        self.pairing.send_modify(|generation| *generation += 1);
         self.wake.notify_waiters();
         self.wake.notify_one();
+    }
+
+    fn generation(&self) -> u64 {
+        *self.pairing.borrow()
     }
 
     /// Moves to `state`, leaving the last message alone.
@@ -430,10 +437,17 @@ enum Ended {
     Transport(String),
     /// The server refused the token. Retry slowly and tell the operator.
     Rejected(String),
+    PairingChanged,
 }
 
 /// Outgoing text frames, from anywhere in the process to the live socket.
-type Outbound = mpsc::UnboundedSender<String>;
+type Outbound = (u64, mpsc::UnboundedSender<String>);
+
+struct QueuedJob {
+    job: PrintJob,
+    generation: u64,
+    default_printer: Option<String>,
+}
 
 /// Starts the supervisor. Returns immediately; the loop lives for the process.
 ///
@@ -507,10 +521,12 @@ fn inside<T>(runtime: &tokio::runtime::Handle, start: impl FnOnce() -> T) -> T {
 /// supervisor also removes a process-global from the hot path — two supervisors
 /// in one test binary no longer have to agree on an environment variable.
 fn spawn_with(settings: SettingsStore, ledger_path: PathBuf, printers: PrinterBeat) -> RelayHandle {
+    let (pairing, _) = watch::channel(0);
     let handle = RelayHandle {
         settings,
         status: Arc::new(RwLock::new(RelayStatus::default())),
         wake: Arc::new(Notify::new()),
+        pairing,
     };
 
     let worker = handle.clone();
@@ -528,13 +544,14 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
     let ledger = acquire_ledger(&handle, &ledger_path).await;
 
     let outbound: Arc<StdMutex<Option<Outbound>>> = Arc::new(StdMutex::new(None));
-    let (tx, rx) = mpsc::channel::<PrintJob>(PRINT_QUEUE_DEPTH);
+    let (tx, rx) = mpsc::channel::<QueuedJob>(PRINT_QUEUE_DEPTH);
     tokio::spawn(print_worker(rx, ledger, outbound.clone(), handle.clone()));
 
     let mut attempt: u32 = 0;
 
     loop {
         let settings = handle.settings.snapshot();
+        let generation = handle.generation();
         let Some(token) = settings.station_token.clone() else {
             handle.mutate(|s| {
                 s.state = RelayState::Unpaired;
@@ -551,7 +568,8 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
         handle.set_state(RelayState::Connecting);
 
         let started = Instant::now();
-        let ended = run_connection(&handle, &url, &token, &tx, &outbound, &printers).await;
+        let ended =
+            run_connection(&handle, &url, &token, generation, &tx, &outbound, &printers).await;
         let held = started.elapsed();
 
         if let Ok(mut guard) = outbound.lock() {
@@ -559,6 +577,10 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
         }
 
         let delay = match ended {
+            Ended::PairingChanged => {
+                attempt = 0;
+                continue;
+            }
             Ended::Rejected(msg) => {
                 tracing::error!(err = %msg, "relay rejected: the station token is not valid");
                 handle.fail(
@@ -741,11 +763,23 @@ async fn run_connection(
     handle: &RelayHandle,
     url: &str,
     token: &str,
-    jobs: &mpsc::Sender<PrintJob>,
+    generation: u64,
+    jobs: &mpsc::Sender<QueuedJob>,
     outbound: &Arc<StdMutex<Option<Outbound>>>,
     printers: &PrinterBeat,
 ) -> Ended {
-    let (stream, _response) = match tokio_tungstenite::connect_async(url).await {
+    let mut pairing = handle.pairing.subscribe();
+    if *pairing.borrow() != generation {
+        return Ended::PairingChanged;
+    }
+    let connected = tokio::select! {
+        changed = pairing.changed() => {
+            let _ = changed;
+            return Ended::PairingChanged;
+        }
+        connected = tokio_tungstenite::connect_async(url) => connected,
+    };
+    let (stream, _response) = match connected {
         Ok(pair) => pair,
         Err(e) => return Ended::Transport(format!("no se pudo conectar: {e}")),
     };
@@ -754,7 +788,14 @@ async fn run_connection(
     // The OPEN packet has to come first. Anything else here means we are not
     // talking to an Engine.IO v4 endpoint at all (a proxy, a login page, the
     // wrong URL) and saying so beats timing out in silence.
-    let open = match next_text(&mut source, HANDSHAKE_TIMEOUT).await {
+    let first = tokio::select! {
+        changed = pairing.changed() => {
+            let _ = changed;
+            return Ended::PairingChanged;
+        }
+        first = next_text(&mut source, HANDSHAKE_TIMEOUT) => first,
+    };
+    let open = match first {
         Ok(Some(frame)) => match engineio::parse(&frame) {
             Incoming::Open(open) => *open,
             other => {
@@ -783,7 +824,14 @@ async fn run_connection(
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        match next_text(&mut source, left).await {
+        let frame = tokio::select! {
+            changed = pairing.changed() => {
+                let _ = changed;
+                return Ended::PairingChanged;
+            }
+            frame = next_text(&mut source, left) => frame,
+        };
+        match frame {
             Ok(Some(frame)) => match engineio::parse(&frame) {
                 Incoming::Connected { ref namespace, .. } if namespace == NAMESPACE => break,
                 Incoming::ConnectError { message, .. } => return Ended::Rejected(message),
@@ -814,7 +862,7 @@ async fn run_connection(
     // is what keeps a single `SplitSink` from needing a lock on every frame.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     if let Ok(mut guard) = outbound.lock() {
-        *guard = Some(out_tx.clone());
+        *guard = Some((generation, out_tx.clone()));
     }
 
     let writer = tokio::spawn(async move {
@@ -861,7 +909,14 @@ async fn run_connection(
     let silence_limit = Duration::from_millis(open.ping_interval + open.ping_timeout);
 
     let ended = loop {
-        match next_text(&mut source, silence_limit).await {
+        let frame = tokio::select! {
+            changed = pairing.changed() => {
+                let _ = changed;
+                break Ended::PairingChanged;
+            }
+            frame = next_text(&mut source, silence_limit) => frame,
+        };
+        match frame {
             Ok(Some(frame)) => match engineio::parse(&frame) {
                 Incoming::Ping => {
                     if out_tx.send(engineio::pong().to_string()).is_err() {
@@ -880,7 +935,11 @@ async fn run_connection(
                                 // `try_send`, not `send`: blocking the reader on
                                 // a full queue also blocks the heartbeat, and a
                                 // slow printer would look like a dead link.
-                                if let Err(e) = jobs.try_send(job) {
+                                if let Err(e) = jobs.try_send(QueuedJob {
+                                    job,
+                                    generation,
+                                    default_printer: handle.settings.snapshot().default_printer,
+                                }) {
                                     tracing::error!(err = %e, "print queue full; the server will replay the job");
                                     handle.mutate(|s| {
                                         s.last_error = Some(
@@ -1002,7 +1061,7 @@ where
 /// kitchen mistake. It owns the ledger outright, which is what keeps "claim
 /// then print" free of locking games.
 async fn print_worker(
-    mut rx: mpsc::Receiver<PrintJob>,
+    mut rx: mpsc::Receiver<QueuedJob>,
     mut ledger: JobLedger,
     outbound: Arc<StdMutex<Option<Outbound>>>,
     handle: RelayHandle,
@@ -1010,7 +1069,12 @@ async fn print_worker(
     let printed = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
 
-    while let Some(job) = rx.recv().await {
+    while let Some(queued) = rx.recv().await {
+        if queued.generation != handle.generation() {
+            tracing::warn!(job_id = %queued.job.job_id, "discarding job from an old pairing");
+            continue;
+        }
+        let job = queued.job;
         let job_id = job.job_id.clone();
 
         // ── The order that matters (R8) ─────────────────────────────────
@@ -1023,7 +1087,7 @@ async fn print_worker(
                 // not print it. A silent duplicate receipt is worse than a
                 // missing one that says so.
                 tracing::error!(job_id = %job_id, err = %e, "cannot record the job; refusing to print it");
-                ack(&outbound, &job_id, false, Some(format!(
+                ack(&outbound, queued.generation, &job_id, false, Some(format!(
                     "El bridge no pudo registrar el trabajo antes de imprimirlo ({e}); no se imprimió para evitar duplicados."
                 )));
                 continue;
@@ -1048,10 +1112,16 @@ async fn print_worker(
                     ),
                 )
             }
-            Claim::Fresh => match deliver(&handle, job).await {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
-            },
+            Claim::Fresh if queued.generation != handle.generation() => (
+                false,
+                Some("La estación cambió antes de enviar el trabajo a la impresora.".into()),
+            ),
+            Claim::Fresh => {
+                match deliver(&handle, job, queued.default_printer, queued.generation).await {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                }
+            }
         };
 
         if fresh {
@@ -1071,7 +1141,7 @@ async fn print_worker(
             });
         }
 
-        ack(&outbound, &job_id, ok, error);
+        ack(&outbound, queued.generation, &job_id, ok, error);
     }
 }
 
@@ -1080,15 +1150,19 @@ async fn print_worker(
 /// Runs on a blocking thread: the spooler call is synchronous and can sit for
 /// seconds on a printer that is switched off, and stalling the runtime would
 /// take the socket down with it.
-async fn deliver(handle: &RelayHandle, job: PrintJob) -> Result<(), String> {
-    let settings = handle.settings.snapshot();
+async fn deliver(
+    handle: &RelayHandle,
+    job: PrintJob,
+    default_printer: Option<String>,
+    generation: u64,
+) -> Result<(), String> {
     let target = job
         .os_printer_name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| settings.default_printer.clone())
+        .or(default_printer)
         .ok_or_else(|| {
             "El trabajo no trae nombre de impresora y esta estación no tiene una por defecto."
                 .to_string()
@@ -1106,15 +1180,23 @@ async fn deliver(handle: &RelayHandle, job: PrintJob) -> Result<(), String> {
 
     let copies = job.copies.clamp(1, 10);
     let name = target.clone();
+    let pairing = handle.pairing.clone();
     tokio::task::spawn_blocking(move || {
         for _ in 0..copies {
-            printer::print_raw(&name, &bytes)?;
+            // spawn_blocking can wait in Tokio's pool after the async caller
+            // checked the epoch. A job not yet in the spooler is still safe
+            // to cancel; an already-running spooler call is uncertain.
+            if *pairing.borrow() != generation {
+                return Err(
+                    "La estación cambió antes de enviar el trabajo a la impresora.".to_string(),
+                );
+            }
+            printer::print_raw(&name, &bytes).map_err(|e| e.to_string())?;
         }
-        Ok::<(), crate::error::BridgeError>(())
+        Ok::<(), String>(())
     })
     .await
-    .map_err(|e| format!("la tarea de impresión no terminó: {e}"))?
-    .map_err(|e| format!("{e}"))?;
+    .map_err(|e| format!("la tarea de impresión no terminó: {e}"))??;
 
     tracing::info!(job_id = %job.job_id, printer = %target, copies, "printed");
     Ok(())
@@ -1123,10 +1205,23 @@ async fn deliver(handle: &RelayHandle, job: PrintJob) -> Result<(), String> {
 /// Sends `print-result`. Best-effort by design: a lost ack leaves the job
 /// `sent`, the next replay brings it back, and the ledger answers it again from
 /// disk without printing.
-fn ack(outbound: &Arc<StdMutex<Option<Outbound>>>, job_id: &str, ok: bool, error: Option<String>) {
+fn ack(
+    outbound: &Arc<StdMutex<Option<Outbound>>>,
+    generation: u64,
+    job_id: &str,
+    ok: bool,
+    error: Option<String>,
+) {
     let sender = match outbound.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+        Ok(guard) => guard
+            .as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, tx)| tx.clone()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, tx)| tx.clone()),
     };
     let Some(sender) = sender else {
         tracing::warn!(job_id = %job_id, "no live socket to ack on; the server will replay");
@@ -1437,6 +1532,7 @@ mod tests {
     struct HelloSpy {
         addr: SocketAddr,
         hellos: Arc<StdMutex<Vec<serde_json::Value>>>,
+        closed: Arc<AtomicU64>,
     }
 
     impl HelloSpy {
@@ -1446,20 +1542,29 @@ mod tests {
                 .expect("bind the hello spy");
             let addr = listener.local_addr().expect("local addr");
             let hellos = Arc::new(StdMutex::new(Vec::new()));
+            let closed = Arc::new(AtomicU64::new(0));
 
             let captured = hellos.clone();
+            let closed_connections = closed.clone();
             tokio::spawn(async move {
                 let mut connection = 0usize;
                 while let Ok((stream, _)) = listener.accept().await {
                     let captured = captured.clone();
+                    let closed = closed_connections.clone();
                     connection += 1;
                     // Hang up on the first connection only: the second has to
                     // stay open long enough to be read.
                     let hang_up = connection == 1;
-                    tokio::spawn(async move { Self::serve(stream, captured, hang_up).await });
+                    tokio::spawn(
+                        async move { Self::serve(stream, captured, closed, hang_up).await },
+                    );
                 }
             });
-            Self { addr, hellos }
+            Self {
+                addr,
+                hellos,
+                closed,
+            }
         }
 
         fn url(&self) -> String {
@@ -1476,6 +1581,7 @@ mod tests {
         async fn serve(
             stream: tokio::net::TcpStream,
             hellos: Arc<StdMutex<Vec<serde_json::Value>>>,
+            closed: Arc<AtomicU64>,
             hang_up: bool,
         ) {
             let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -1524,7 +1630,202 @@ mod tests {
                     }
                 }
             }
+            closed.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpair_closes_the_active_relay_socket_without_waiting_for_a_ping() {
+        let spy = HelloSpy::start().await;
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some(spy.url()),
+            station_token: Some("station-a".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings.clone(),
+            temp_dir("unpair-active").join("print-jobs.jsonl"),
+            beat_with(Duration::from_secs(1), || Ok(vec!["Caja".into()])),
+        );
+        assert!(wait_for(Duration::from_secs(20), || spy.hellos().len() >= 2).await);
+
+        crate::pairing::forget(&settings).expect("forget station A");
+        handle.reconnect();
+
+        assert!(
+            wait_for(Duration::from_secs(2), || spy.closed.load(Ordering::SeqCst)
+                > 0)
+            .await,
+            "unpair left the old station socket live until the heartbeat timeout"
+        );
+        assert_eq!(handle.status().state, RelayState::Unpaired);
+    }
+
+    #[tokio::test]
+    async fn queued_job_from_a_previous_pairing_is_not_claimed() {
+        let settings = SettingsStore::in_memory(Settings {
+            station_token: Some("station-a".into()),
+            ..Default::default()
+        });
+        let handle = RelayHandle {
+            settings: settings.clone(),
+            status: Arc::new(RwLock::new(RelayStatus::default())),
+            wake: Arc::new(Notify::new()),
+            pairing: watch::channel(0).0,
+        };
+        let path = temp_dir("stale-pairing-job").join("print-jobs.jsonl");
+        let ledger = JobLedger::open(&path).expect("open ledger");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(QueuedJob {
+            job: PrintJob {
+                job_id: "job-from-station-a".into(),
+                role: String::new(),
+                kind: String::new(),
+                os_printer_name: None,
+                escpos_base64: BASE64.encode(b"ticket"),
+                copies: 1,
+                order_id: None,
+            },
+            generation: handle.generation(),
+            default_printer: None,
+        })
+        .await
+        .expect("queue job from A");
+        drop(tx);
+
+        settings
+            .update(|s| s.station_token = None)
+            .expect("unpair station A");
+        handle.reconnect();
+        print_worker(rx, ledger, Arc::new(StdMutex::new(None)), handle).await;
+
+        let mut ledger = JobLedger::open(path).expect("reopen ledger");
+        assert_eq!(
+            ledger.claim("job-from-station-a").expect("claim"),
+            Claim::Fresh,
+            "a queued job from A reached the ledger after unpair"
+        );
+    }
+
+    #[test]
+    fn result_from_station_a_is_not_sent_on_station_b_socket() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let outbound = Arc::new(StdMutex::new(Some((2, tx))));
+
+        ack(&outbound, 1, "job-from-a", true, None);
+        assert!(rx.try_recv().is_err(), "station B received station A's ack");
+
+        ack(&outbound, 2, "job-from-b", true, None);
+        let frame = rx.try_recv().expect("station B's ack");
+        assert!(frame.contains("job-from-b"));
+    }
+
+    #[test]
+    fn unpair_fences_a_job_waiting_for_a_blocking_spooler_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sink = temp_dir("pairing-blocking-pool");
+        std::env::set_var("GOURMELYPRINT_SINK_DIR", &sink);
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("signal blocked thread");
+                release_rx.recv().expect("release blocked thread");
+            });
+            started_rx.await.expect("blocking pool occupied");
+
+            let settings = SettingsStore::in_memory(Settings {
+                station_token: Some("station-a".into()),
+                ..Default::default()
+            });
+            let handle = RelayHandle {
+                settings: settings.clone(),
+                status: Arc::new(RwLock::new(RelayStatus::default())),
+                wake: Arc::new(Notify::new()),
+                pairing: watch::channel(0).0,
+            };
+            let path = temp_dir("pairing-blocking-ledger").join("jobs.jsonl");
+            let ledger = JobLedger::open(&path).expect("ledger");
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(QueuedJob {
+                job: PrintJob {
+                    job_id: "old-station-pool-job".into(),
+                    role: String::new(),
+                    kind: String::new(),
+                    os_printer_name: Some("FakePrinter".into()),
+                    escpos_base64: BASE64.encode(b"ticket"),
+                    copies: 1,
+                    order_id: None,
+                },
+                generation: handle.generation(),
+                default_printer: None,
+            })
+            .await
+            .expect("queue A job");
+            drop(tx);
+
+            let worker = tokio::spawn(print_worker(
+                rx,
+                ledger,
+                Arc::new(StdMutex::new(None)),
+                handle.clone(),
+            ));
+            assert!(
+                wait_for(Duration::from_secs(2), || std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .contains("old-station-pool-job"))
+                .await,
+                "job never reached the blocking-pool queue"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(std::fs::read_dir(&sink).expect("sink").count(), 0);
+
+            settings
+                .update(|s| s.station_token = None)
+                .expect("unpair A");
+            handle.reconnect();
+            release_tx.send(()).expect("release pool");
+            blocker.await.expect("blocker complete");
+            worker.await.expect("worker complete");
+            assert_eq!(
+                std::fs::read_dir(&sink).expect("sink").count(),
+                0,
+                "old station job entered the spooler after unpair"
+            );
+        });
+        std::env::remove_var("GOURMELYPRINT_SINK_DIR");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repairing_closes_a_socket_and_opens_a_new_connection() {
+        let spy = HelloSpy::start().await;
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some(spy.url()),
+            station_token: Some("station-a".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings.clone(),
+            temp_dir("repair-active").join("jobs.jsonl"),
+            beat_with(Duration::from_secs(1), || Ok(vec!["Caja".into()])),
+        );
+        assert!(wait_for(Duration::from_secs(20), || spy.hellos().len() >= 2).await);
+        settings
+            .update(|s| s.station_token = Some("station-b".into()))
+            .expect("re-pair as B");
+        handle.reconnect();
+        assert!(
+            wait_for(Duration::from_secs(2), || spy.closed.load(Ordering::SeqCst)
+                > 0)
+            .await
+        );
+        assert!(wait_for(Duration::from_secs(2), || spy.hellos().len() >= 3).await);
+        assert_eq!(handle.status().state, RelayState::Connected);
     }
 
     /// The whole of P3, through the real wiring: connect, beat, lose the
