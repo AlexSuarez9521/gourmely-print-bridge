@@ -22,20 +22,15 @@
 //!
 //! The embedded cert is the **safety net, not the fallback of last resort**: a
 //! truncated download, a half-written file or a swapped cert/key pair must
-//! never take printing offline. The PEM on disk is parsed *before* it is
-//! trusted, and any problem logs loudly and keeps the embedded material. The
-//! only way to end up with no TLS is for the embedded cert itself to be broken,
-//! which the build would have caught.
-//!
-//! # What this does NOT do yet
-//!
-//! It does not compare expiry dates: if a file is present and parses, it wins.
-//! That is safe for the automated renewal (which only ever writes a fresh
-//! cert), but a human who drops an *expired* file would take the bridge down
-//! until they remove it. Comparing `notAfter` needs an X.509 parser
-//! (`x509-parser`), deliberately left out of this change to keep it small.
+//! never take printing offline. The PEM on disk is validated for key match,
+//! trust chain, hostname, and current validity before selection. A bad override
+//! falls back only if the embedded pair independently validates; otherwise
+//! startup fails with an actionable diagnostic.
 
+use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::{CertificateDer, UnixTime};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Where a renewal drops the new PEM pair.
 ///
@@ -60,31 +55,71 @@ pub struct TlsMaterial {
     pub source: &'static str,
 }
 
-/// Does this pair actually parse as a certificate chain and a private key?
-///
-/// A pure parse check via `rustls-pemfile`: no crypto provider needed (unlike
-/// `RustlsConfig::from_pem`, which panics unless a provider was installed
-/// first), no async, no I/O. Catches the realistic failures — empty file, HTML
-/// error page saved as `.pem`, cert and key swapped, truncated download.
-fn pem_pair_parses(cert: &[u8], key: &[u8]) -> bool {
+/// Parse a PEM pair and prove that its private key matches the leaf certificate.
+fn matching_chain(cert: &[u8], key: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
     let mut cert_reader = std::io::BufReader::new(cert);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>();
-    let chain_ok = matches!(certs, Ok(ref chain) if !chain.is_empty());
+    let certs = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("parse certificate chain: {error}"))?;
+    if certs.is_empty() {
+        return Err("certificate chain is empty".into());
+    }
 
     let mut key_reader = std::io::BufReader::new(key);
-    let key_ok = matches!(rustls_pemfile::private_key(&mut key_reader), Ok(Some(_)));
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|error| format!("parse private key: {error}"))?
+        .ok_or("private key is missing")?;
 
-    chain_ok && key_ok
+    rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .and_then(|builder| {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+    })
+    .map_err(|error| format!("certificate/key mismatch: {error}"))?;
+    Ok(certs)
 }
 
-/// Pick the TLS material to serve: the PEM pair on disk when it is present and
-/// parses, otherwise the embedded one. Never fails — worst case it returns the
-/// embedded material.
-pub fn resolve(embedded_cert: &[u8], embedded_key: &[u8]) -> TlsMaterial {
-    let embedded = || TlsMaterial {
-        cert: embedded_cert.to_vec(),
-        key: embedded_key.to_vec(),
-        source: "embedded",
+fn validate_pair_at(cert: &[u8], key: &[u8], host: &str, now: UnixTime) -> Result<(), String> {
+    let certs = matching_chain(cert, key)?;
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+    )
+    .build()
+    .map_err(|error| format!("TLS verifier: {error}"))?;
+    let server_name = host
+        .try_into()
+        .map_err(|error| format!("invalid TLS hostname: {error}"))?;
+    verifier
+        .verify_server_cert(&certs[0], &certs[1..], &server_name, &[], now)
+        .map_err(|error| format!("certificate is not valid for {host}: {error}"))?;
+    Ok(())
+}
+
+/// Pick a validated disk pair, or independently validate the embedded fallback.
+pub fn resolve(embedded_cert: &[u8], embedded_key: &[u8]) -> Result<TlsMaterial, String> {
+    resolve_at(embedded_cert, embedded_key, UnixTime::now())
+}
+
+fn resolve_at(
+    embedded_cert: &[u8],
+    embedded_key: &[u8],
+    now: UnixTime,
+) -> Result<TlsMaterial, String> {
+    let embedded = || {
+        validate_pair_at(embedded_cert, embedded_key, crate::config::BRIDGE_HOST, now).map_err(
+            |error| format!("no usable local TLS certificate; install a valid PEM pair: {error}"),
+        )?;
+        Ok(TlsMaterial {
+            cert: embedded_cert.to_vec(),
+            key: embedded_key.to_vec(),
+            source: "embedded",
+        })
     };
 
     let Some(dir) = cert_dir() else {
@@ -115,28 +150,34 @@ pub fn resolve(embedded_cert: &[u8], embedded_key: &[u8]) -> TlsMaterial {
         }
     };
 
-    if !pem_pair_parses(&cert, &key) {
+    if let Err(error) = validate_pair_at(&cert, &key, crate::config::BRIDGE_HOST, now) {
         tracing::error!(
             dir = %dir.display(),
-            "certificate override does not parse as a chain + private key; keeping the embedded certificate"
+            %error,
+            "certificate override is unusable; checking embedded certificate"
         );
         return embedded();
     }
 
     tracing::info!(dir = %dir.display(), "serving the certificate found on disk");
-    TlsMaterial {
+    Ok(TlsMaterial {
         cert,
         key,
         source: "disk",
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
 
     const EMBEDDED_CERT: &[u8] = include_bytes!("../certs/fullchain.pem");
     const EMBEDDED_KEY: &[u8] = include_bytes!("../certs/privkey.pem");
+    const UNRELATED_KEY: &[u8] = include_bytes!("../tests/fixtures/unrelated-key.pem");
+    const VALID_AT: rustls::pki_types::UnixTime = rustls::pki_types::UnixTime::since_unix_epoch(
+        std::time::Duration::from_secs(1_792_108_800),
+    );
 
     /// Isolates `GOURMELYPRINT_CERT_DIR` per test. Tests in one binary share
     /// the process environment, so they must not run in parallel over it —
@@ -162,23 +203,24 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_certificate_parses() {
-        // Guards the safety net itself: if the embedded pair ever stops
-        // parsing, every fallback path in this module is worthless.
-        assert!(pem_pair_parses(EMBEDDED_CERT, EMBEDDED_KEY));
+    fn the_shipped_certificate_validates_at_its_issue_date() {
+        assert!(
+            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, VALID_AT).is_ok()
+        );
     }
 
     #[test]
     fn rejects_garbage_and_swapped_pairs() {
-        assert!(!pem_pair_parses(b"not a pem at all", EMBEDDED_KEY));
-        assert!(!pem_pair_parses(EMBEDDED_CERT, b""));
+        assert!(matching_chain(b"not a pem at all", EMBEDDED_KEY).is_err());
+        assert!(matching_chain(EMBEDDED_CERT, b"").is_err());
         // Cert where the key is expected, and vice versa.
-        assert!(!pem_pair_parses(EMBEDDED_KEY, EMBEDDED_CERT));
+        assert!(matching_chain(EMBEDDED_KEY, EMBEDDED_CERT).is_err());
     }
 
     #[test]
     fn falls_back_to_embedded_when_nothing_on_disk() {
-        let material = with_cert_dir(None, || resolve(EMBEDDED_CERT, EMBEDDED_KEY));
+        let material =
+            with_cert_dir(None, || resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)).unwrap();
         assert_eq!(material.source, "embedded");
         assert_eq!(material.cert, EMBEDDED_CERT);
     }
@@ -189,7 +231,8 @@ mod tests {
         std::fs::write(dir.join("fullchain.pem"), EMBEDDED_CERT).unwrap();
         std::fs::write(dir.join("privkey.pem"), EMBEDDED_KEY).unwrap();
 
-        let material = with_cert_dir(Some(&dir), || resolve(b"ignored", b"ignored"));
+        let material =
+            with_cert_dir(Some(&dir), || resolve_at(b"ignored", b"ignored", VALID_AT)).unwrap();
 
         assert_eq!(material.source, "disk");
         assert_eq!(material.cert, EMBEDDED_CERT);
@@ -201,7 +244,10 @@ mod tests {
         std::fs::write(dir.join("fullchain.pem"), b"<html>404</html>").unwrap();
         std::fs::write(dir.join("privkey.pem"), EMBEDDED_KEY).unwrap();
 
-        let material = with_cert_dir(Some(&dir), || resolve(EMBEDDED_CERT, EMBEDDED_KEY));
+        let material = with_cert_dir(Some(&dir), || {
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+        })
+        .unwrap();
 
         assert_eq!(material.source, "embedded");
     }
@@ -212,8 +258,62 @@ mod tests {
         let dir = temp_dir("half");
         std::fs::write(dir.join("fullchain.pem"), EMBEDDED_CERT).unwrap();
 
-        let material = with_cert_dir(Some(&dir), || resolve(EMBEDDED_CERT, EMBEDDED_KEY));
+        let material = with_cert_dir(Some(&dir), || {
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+        })
+        .unwrap();
 
         assert_eq!(material.source, "embedded");
+    }
+
+    #[test]
+    fn mismatched_but_parseable_disk_pair_falls_back_to_embedded() {
+        let dir = temp_dir("mismatched-key");
+        std::fs::write(dir.join("fullchain.pem"), EMBEDDED_CERT).unwrap();
+        std::fs::write(dir.join("privkey.pem"), UNRELATED_KEY).unwrap();
+        assert!(
+            rustls_pemfile::private_key(&mut std::io::BufReader::new(UNRELATED_KEY))
+                .unwrap()
+                .is_some()
+        );
+
+        let material = with_cert_dir(Some(&dir), || {
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+        })
+        .unwrap();
+
+        assert_eq!(material.source, "embedded");
+        assert_eq!(material.cert, EMBEDDED_CERT);
+        assert_eq!(material.key, EMBEDDED_KEY);
+    }
+
+    #[test]
+    fn rejects_expired_pair_even_when_key_matches() {
+        let after_expiry = rustls::pki_types::UnixTime::since_unix_epoch(
+            std::time::Duration::from_secs(1_798_761_600),
+        );
+        assert!(
+            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, VALID_AT).is_ok()
+        );
+        assert!(validate_pair_at(
+            EMBEDDED_CERT,
+            EMBEDDED_KEY,
+            config::BRIDGE_HOST,
+            after_expiry
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_certificate_for_another_hostname() {
+        assert!(validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, "wrong.invalid", VALID_AT).is_err());
+    }
+
+    #[test]
+    fn invalid_embedded_pair_requires_action_instead_of_serving_it() {
+        let error = with_cert_dir(None, || resolve_at(b"invalid", b"invalid", VALID_AT))
+            .err()
+            .expect("must refuse invalid embedded pair");
+        assert!(error.contains("install a valid PEM pair"), "{error}");
     }
 }

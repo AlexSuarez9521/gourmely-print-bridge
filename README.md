@@ -53,7 +53,11 @@ the socket open, so there is no port to forward and no static IP to buy.
   `%PROGRAMDATA%\GourmelyPrint\config.json`. No file editing, ever.
 - **Transport.** Socket.IO v5 over Engine.IO v4, namespace `/print`, spoken by
   hand in `src/engineio.rs` — see the module header for why an off-the-shelf
-  client did not survive contact with the real server.
+  client did not survive contact with the real server. Remote API endpoints
+  require HTTPS; HTTP is permitted only for explicit loopback development
+  endpoints. Pairing never follows redirects. A station paired to an older
+  remote HTTP URL stops before sending its token and shows a security warning
+  in the settings, tray, and `/health`; re-pair it with the HTTPS URL.
 - **Reconnection.** Infinite, exponential, capped at 60 s. A revoked token is
   told apart from a dead link: it backs off to 5 minutes and the UI says "vuelve
   a vincular" instead of "sin conexión".
@@ -142,6 +146,18 @@ which is also how you inspect what actually came out.
 cargo test --test relay_e2e -- --ignored --nocapture
 ```
 
+UI security tests run against Vite with mocked Tauri IPC and the configured
+production CSP as a browser response header. They need no model key, backend,
+or printer; they do not replace a packaged WebView/MSI smoke test.
+CI runs the browser tests on Ubuntu (the e2e runner documents Windows via WSL)
+and the version/CSP static checks alongside Rust checks on Windows.
+
+```bash
+npm run test:e2e
+npm run test:csp
+npm run test:version
+```
+
 ## Releases (maintainers)
 
 `.github/workflows/release.yml` builds and publishes the MSI on every
@@ -153,7 +169,9 @@ so customers always get the newest build from a single direct-download
 link — they never browse this repo.
 
 ```bash
-# 1. Bump version in src-tauri/tauri.conf.json AND src-tauri/Cargo.toml
+# 1. Bump Tauri/Cargo metadata with ops/bump-version.py --set X.Y.Z;
+#    bump package.json with npm pkg set version=X.Y.Z and refresh package-lock.json.
+#    Confirm all six version values with npm run test:version.
 # 2. Commit + merge to main
 # 3. Tag + push:
 git tag v0.1.1
@@ -171,6 +189,30 @@ automatically once the `WINDOWS_CODE_SIGN_PFX_BASE64` secret is set.
 
 The committed TLS private key is safe by design — see
 [SECURITY.md](SECURITY.md).
+
+On Windows, the bridge protects `%PROGRAMDATA%\GourmelyPrint` and existing
+config/print-ledger files for the active console or RDP user, SYSTEM, and
+Administrators. An OWNER RIGHTS entry prevents a legacy owner from restoring
+access by rewriting the ACL. An already protected directory or file cannot
+be reassigned to another active Windows user. If ACL repair fails, readable
+config remains available but settings writes stop; `/health.configuration_security`
+and the status panel explain the repair.
+
+For installation or repair, stop the bridge, install binaries as Administrator
+**without launching the bridge**, then start it only from the cashier's
+interactive session. Never launch it from an SSH or administrator session.
+For a legacy ACL that still needs elevation, keep the cashier's session active,
+run the bridge once elevated from that session, close the elevated instance,
+and start it normally as the cashier. If the status says files belong to
+another Windows user, do not reassign the ACL manually; close other sessions
+and use the correct cashier session. Confirm `/health.configuration_security`
+is `null` before pairing or changing settings; do not edit tokens by hand.
+
+If the status instead reports damaged `config.json`, elevation alone cannot
+repair invalid JSON. Stop the bridge and make a restricted-access backup of
+`%PROGRAMDATA%\GourmelyPrint\config.json`; restore a known-good copy or
+rename the damaged file, then restart and re-pair the station. The bridge
+does not overwrite the damaged file while reporting this error.
 
 ## Contributing
 

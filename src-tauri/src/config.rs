@@ -9,7 +9,8 @@
 //! to, the station token it got when it was paired, the secret the local POS
 //! must present — lives in `%PROGRAMDATA%\GourmelyPrint\config.json`, next to
 //! the certs and for the same reason: machine-wide (one bridge serves every
-//! Windows account on the till) and writable without fighting UAC.
+//! Windows account on the till) and protected for the active cashier, SYSTEM,
+//! and Administrators. Existing installs that cannot be repaired stay readable.
 //!
 //! The origin allowlist below is still compile-time. Moving it to the settings
 //! file — so support can point one install at a staging origin without a
@@ -94,6 +95,46 @@ pub const MAX_PRINT_BYTES: usize = 1_024 * 1_024;
 
 /// Where the relay points when nobody has said otherwise.
 pub const DEFAULT_SERVER_URL: &str = "https://api-gourmelyhub.busticco.com";
+
+/// A station credential may only leave over TLS. Plaintext is useful for an
+/// explicitly local simulator, but a hostname that merely starts with
+/// `localhost` is not local. Return a canonical base URL for both pairing and
+/// the outbound relay so persisted settings cannot bypass the pairing check.
+pub fn validated_server_url(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Falta la dirección del servidor de GourmelyHub.".into());
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let url = reqwest::Url::parse(&candidate)
+        .map_err(|_| "La dirección del servidor no es una URL válida.".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "La dirección del servidor necesita un host.".to_string())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "La dirección del servidor no puede incluir credenciales ni parámetros.".into(),
+        );
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("Usa HTTPS para servidores remotos; HTTP solo se permite en localhost.".into());
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
 
 /// How the local WSS decides whether a caller may print.
 ///
@@ -196,41 +237,65 @@ fn generate_secret() -> BridgeResult<String> {
     Ok(BASE64URL.encode(bytes))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigReadIssue {
+    Malformed,
+    Unreadable,
+}
+
+#[cfg(windows)]
+const ACL_REPAIR_ACTION: &str = "La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.";
+
+#[cfg(windows)]
+const MALFORMED_CONFIG_ACTION: &str = "config.json está dañado: detén GourmelyPrint Bridge, haz un respaldo seguro del archivo y restaura una copia válida o renómbralo; luego reinicia y vuelve a emparejar la estación.";
+
+#[cfg(windows)]
+const OTHER_USER_ACTION: &str = "Los archivos protegidos pertenecen a otro usuario de Windows. No se cambiaron los permisos: cierra Bridge, inicia la sesión de caja correcta y ejecuta la reparación como administrador con esa sesión activa.";
+
 /// Reads the settings file, tolerating every way it can be absent or broken.
 ///
 /// A corrupt file must never stop the bridge from booting: the till would lose
 /// printing over a JSON typo. It falls back to defaults and logs loudly, the
 /// same posture as `tls_material`.
-fn load_from_disk() -> Settings {
+fn load_from_disk() -> (Settings, Option<ConfigReadIssue>) {
     let Some(path) = settings_path() else {
         tracing::warn!("no data directory resolvable; running with in-memory settings");
-        return Settings::default();
+        return (Settings::default(), None);
     };
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-            Ok(s) => s,
+            Ok(s) => (s, None),
             Err(e) => {
                 tracing::error!(path = %path.display(), err = %e, "config.json does not parse; starting from defaults");
-                Settings::default()
+                (Settings::default(), Some(ConfigReadIssue::Malformed))
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
         Err(e) => {
             tracing::error!(path = %path.display(), err = %e, "config.json unreadable; starting from defaults");
-            Settings::default()
+            (Settings::default(), Some(ConfigReadIssue::Unreadable))
         }
     }
 }
 
 /// Writes the settings atomically: a half-written `config.json` would take the
 /// station token with it and the till would silently stop printing remotely.
-fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
+fn save_to_disk(settings: &Settings, acl_user_sid: Option<&str>) -> BridgeResult<()> {
     let Some(path) = settings_path() else {
         return Err(BridgeError::Config(
             "no hay carpeta de datos donde guardar la configuración".into(),
         ));
     };
     if let Some(parent) = path.parent() {
+        #[cfg(windows)]
+        {
+            let sid = acl_user_sid.ok_or_else(|| {
+                BridgeError::Config("config security repair requires an interactive user".into())
+            })?;
+            crate::windows_acl::protect_data_dir_for_user(parent, sid)?;
+        }
+        #[cfg(not(windows))]
+        let _ = acl_user_sid;
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_vec_pretty(settings)
@@ -239,6 +304,11 @@ fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
     let tmp = path.with_extension("json.tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
+        #[cfg(windows)]
+        crate::windows_acl::protect_file_for_user(
+            &tmp,
+            acl_user_sid.expect("preflight required a Windows SID"),
+        )?;
         file.write_all(&body)?;
         file.sync_all()?;
     }
@@ -254,6 +324,10 @@ fn save_to_disk(settings: &Settings) -> BridgeResult<()> {
 #[derive(Clone)]
 pub struct SettingsStore {
     inner: Arc<RwLock<Settings>>,
+    persist: bool,
+    security_issue: Option<String>,
+    #[cfg(windows)]
+    acl_user_sid: Option<String>,
 }
 
 impl SettingsStore {
@@ -263,16 +337,94 @@ impl SettingsStore {
     /// secure default real: an install that has never been configured still
     /// comes up with a secret ready for the web to present.
     pub fn load() -> Self {
-        let mut settings = load_from_disk();
+        #[cfg(windows)]
+        let acl = {
+            // CI has no cashier session. The override is compiled out of
+            // release builds and only applies to an isolated data directory.
+            #[cfg(debug_assertions)]
+            let fixture_sid = std::env::var("GOURMELYPRINT_ACL_TEST_SID")
+                .ok()
+                .filter(|_| std::env::var_os("GOURMELYPRINT_DATA_DIR").is_some());
+            #[cfg(not(debug_assertions))]
+            let fixture_sid: Option<String> = None;
+            fixture_sid
+                .map(Ok)
+                .unwrap_or_else(crate::windows_acl::interactive_user_sid)
+        }
+        .and_then(|sid| {
+            let dir = data_dir().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "data directory unavailable")
+            })?;
+            crate::windows_acl::protect_data_dir_for_user(&dir, &sid)?;
+            Ok(sid)
+        });
+        #[cfg(windows)]
+        return Self::load_with_acl(acl);
+        #[cfg(not(windows))]
+        Self::load_with_acl(())
+    }
+
+    #[cfg(windows)]
+    fn load_with_acl(acl: std::io::Result<String>) -> Self {
+        let (settings, read_issue) = load_from_disk();
+        let other_user = acl
+            .as_ref()
+            .err()
+            .and_then(|error| error.get_ref())
+            .is_some_and(|error| error.is::<crate::windows_acl::ProtectedUserMismatch>());
+        let acl_error = acl.as_ref().err().map(|e| e.to_string());
+        let acl_user_sid = acl.ok();
+        let security_issue = if other_user {
+            Some(OTHER_USER_ACTION.to_string())
+        } else {
+            match (acl_error.is_some(), read_issue) {
+                (true, _) | (_, Some(ConfigReadIssue::Unreadable)) => {
+                    Some(ACL_REPAIR_ACTION.to_string())
+                }
+                (false, Some(ConfigReadIssue::Malformed)) => {
+                    Some(MALFORMED_CONFIG_ACTION.to_string())
+                }
+                (false, None) => None,
+            }
+        };
+        if let Some(error) = acl_error {
+            tracing::error!(%error, "Windows credential ACL migration failed; preserving existing files read-only");
+        }
+        Self::finish_load(settings, security_issue, acl_user_sid)
+    }
+
+    #[cfg(not(windows))]
+    fn load_with_acl(_: ()) -> Self {
+        let (settings, _) = load_from_disk();
+        Self::finish_load(settings, None)
+    }
+
+    fn finish_load(
+        mut settings: Settings,
+        security_issue: Option<String>,
+        #[cfg(windows)] acl_user_sid: Option<String>,
+    ) -> Self {
+        #[cfg(windows)]
+        let mut security_issue = security_issue;
         if settings.local_secret.is_none() {
             match generate_secret() {
                 Ok(secret) => {
                     settings.local_secret = Some(secret);
-                    if let Err(e) = save_to_disk(&settings) {
-                        // Not fatal: the bridge runs with an in-memory secret
-                        // and the POS keeps printing through the origin check.
-                        // It just has to be re-issued on the next boot.
-                        tracing::error!(err = %e, "could not persist the generated local secret");
+                    if security_issue.is_none() {
+                        #[cfg(windows)]
+                        let sid = acl_user_sid.as_deref();
+                        #[cfg(not(windows))]
+                        let sid = None;
+                        if let Err(e) = save_to_disk(&settings, sid) {
+                            // Not fatal: the bridge runs with an in-memory secret
+                            // and the POS keeps printing through the origin check.
+                            // It just has to be re-issued on the next boot.
+                            tracing::error!(err = %e, "could not persist the generated local secret");
+                            #[cfg(windows)]
+                            {
+                                security_issue = Some(ACL_REPAIR_ACTION.to_string());
+                            }
+                        }
                     }
                 }
                 Err(e) => tracing::error!(err = %e, "could not generate the local secret"),
@@ -280,6 +432,10 @@ impl SettingsStore {
         }
         Self {
             inner: Arc::new(RwLock::new(settings)),
+            persist: true,
+            security_issue,
+            #[cfg(windows)]
+            acl_user_sid,
         }
     }
 
@@ -292,7 +448,21 @@ impl SettingsStore {
     pub fn in_memory(settings: Settings) -> Self {
         Self {
             inner: Arc::new(RwLock::new(settings)),
+            persist: false,
+            security_issue: None,
+            #[cfg(windows)]
+            acl_user_sid: None,
         }
+    }
+
+    pub fn security_issue(&self) -> Option<&str> {
+        self.security_issue.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_security_issue(mut self, detail: &str) -> Self {
+        self.security_issue = Some(detail.to_string());
+        self
     }
 
     /// A snapshot. Callers get a clone rather than a guard so a slow consumer
@@ -316,7 +486,16 @@ impl SettingsStore {
         };
         let mut next = guard.clone();
         f(&mut next);
-        save_to_disk(&next)?;
+        if let Some(issue) = &self.security_issue {
+            return Err(BridgeError::Config(issue.clone()));
+        }
+        if self.persist {
+            #[cfg(windows)]
+            let sid = self.acl_user_sid.as_deref();
+            #[cfg(not(windows))]
+            let sid = None;
+            save_to_disk(&next, sid)?;
+        }
         *guard = next.clone();
         Ok(next)
     }
@@ -327,6 +506,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn in_memory_store_updates_without_a_data_directory() {
+        let store = SettingsStore::in_memory(Settings::default());
+        store
+            .update(|settings| settings.station_token = Some("station-a".into()))
+            .expect("in-memory update");
+        assert_eq!(store.snapshot().station_token.as_deref(), Some("station-a"));
+    }
+
+    #[test]
     fn server_url_falls_back_and_trims() {
         let mut s = Settings::default();
         assert_eq!(s.server_url(), DEFAULT_SERVER_URL);
@@ -334,6 +522,35 @@ mod tests {
         assert_eq!(s.server_url(), "https://api.example.com");
         s.server_url = Some("   ".into());
         assert_eq!(s.server_url(), DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn station_endpoint_requires_tls_except_for_explicit_loopback() {
+        for (input, expected) in [
+            ("https://api.example.com/", "https://api.example.com"),
+            (" api.example.com ", "https://api.example.com"),
+            ("http://localhost:3000/", "http://localhost:3000"),
+            ("http://127.0.0.1:3000/", "http://127.0.0.1:3000"),
+            ("http://[::1]:3000/", "http://[::1]:3000"),
+        ] {
+            assert_eq!(
+                validated_server_url(input).as_deref(),
+                Ok(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "http://api.example.com",
+            "http://192.0.2.1",
+            "http://localhost.evil",
+            "https://user:pass@api.example.com",
+            "https://api.example.com?token=secret",
+            "https://api.example.com#fragment",
+            "ftp://api.example.com",
+            "",
+        ] {
+            assert!(validated_server_url(input).is_err(), "accepted {input}");
+        }
     }
 
     #[test]

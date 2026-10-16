@@ -62,7 +62,7 @@
 //! it is a worse one: a router blip would tell the POS the bridge is missing and
 //! stop the local printing that still works perfectly.
 
-use std::{net::SocketAddr, time::Instant};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
 use axum::{
     extract::{
@@ -76,17 +76,23 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::{
     config::{bind_port, LocalAuth, SettingsStore, ALLOWED_ORIGINS, MAX_PRINT_BYTES},
-    error::BridgeError,
+    error::{BridgeError, BridgeResult},
+    local_job_ledger::{Claim, LocalJobLedger, Outcome},
     printer,
     relay::RelayHandle,
 };
 
 /// Process-wide server state. Shared (Arc) across all axum handlers.
+pub type PrintRawFn = dyn Fn(&str, &[u8]) -> BridgeResult<u32> + Send + Sync;
+const MAX_ACTIVE_LOCAL_PRINTS: usize = 4;
+
 #[derive(Clone)]
 pub struct ServerState {
     pub started_at: Instant,
@@ -96,6 +102,10 @@ pub struct ServerState {
     /// router on its own — `/health` then reports the relay as `unknown` rather
     /// than inventing a healthy-looking answer.
     pub relay: Option<RelayHandle>,
+    /// Available only when durable local intent storage opened successfully.
+    pub local_ledger: Option<Arc<LocalJobLedger>>,
+    pub print_raw: Arc<PrintRawFn>,
+    pub print_slots: Arc<Semaphore>,
 }
 
 /// `?token=…` on the upgrade URL.
@@ -200,6 +210,8 @@ struct HealthResponse {
     uptime_seconds: u64,
     printer_count: usize,
     relay: HealthRelay,
+    /// A failed Windows credential migration never silently looks healthy.
+    configuration_security: Option<String>,
 }
 
 /// The relay, as `/health` reports it.
@@ -213,7 +225,7 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct HealthRelay {
     /// `connected` · `connecting` · `rejected` · `standby` ·
-    /// `ledger-unavailable` · `unpaired` · `unknown`.
+    /// `endpoint-insecure` · `ledger-unavailable` · `unpaired` · `unknown`.
     state: String,
     /// Can the server route a ticket to this till right now? This is the field
     /// that answers the question the top-level `ok` was being asked.
@@ -249,6 +261,10 @@ impl HealthRelay {
                 jobs_failed: 0,
             };
         };
+        Self::from_status(status)
+    }
+
+    fn from_status(status: crate::relay::RelayStatus) -> Self {
         Self {
             state: status.state.as_str().to_string(),
             ok: status.state.is_serving(),
@@ -284,6 +300,8 @@ enum WsRequest {
         id: String,
         printer: String,
         data: String,
+        #[serde(rename = "printIntentId")]
+        print_intent_id: Option<String>,
     },
     /// Print a small test ticket — same as the tray "Test print" button
     /// but driven from the web UI.
@@ -297,18 +315,28 @@ enum WsResponse {
         id: String,
         ok: bool,
         printers: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capabilities: Option<PrintCapabilities>,
     },
     PrintOk {
         id: String,
         ok: bool,
         #[serde(rename = "jobId")]
         job_id: u32,
+        #[serde(rename = "printIntentId", skip_serializing_if = "Option::is_none")]
+        print_intent_id: Option<String>,
     },
     Err {
         id: String,
         ok: bool,
         error: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct PrintCapabilities {
+    #[serde(rename = "printIntentId")]
+    print_intent_id: bool,
 }
 
 impl WsResponse {
@@ -366,6 +394,7 @@ async fn health_handler(State(s): State<ServerState>) -> Json<HealthResponse> {
         uptime_seconds: s.started_at.elapsed().as_secs(),
         printer_count,
         relay: HealthRelay::of(s.relay.as_ref()),
+        configuration_security: s.settings.security_issue().map(str::to_owned),
     })
 }
 
@@ -407,7 +436,7 @@ async fn print_ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, _state: ServerState) {
+async fn handle_socket(mut socket: WebSocket, state: ServerState) {
     tracing::info!("ws client connected");
     while let Some(msg) = socket.recv().await {
         let Ok(msg) = msg else {
@@ -416,7 +445,7 @@ async fn handle_socket(mut socket: WebSocket, _state: ServerState) {
         };
         match msg {
             Message::Text(text) => {
-                let response = handle_text(&text).await;
+                let response = handle_text(&text, &state).await;
                 let body = serde_json::to_string(&response)
                     .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize"}"#.into());
                 if socket.send(Message::Text(body)).await.is_err() {
@@ -438,7 +467,7 @@ async fn handle_socket(mut socket: WebSocket, _state: ServerState) {
     tracing::info!("ws client disconnected");
 }
 
-async fn handle_text(text: &str) -> WsResponse {
+async fn handle_text(text: &str, state: &ServerState) -> WsResponse {
     let req: WsRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => return WsResponse::err("", format!("invalid json: {e}")),
@@ -450,6 +479,9 @@ async fn handle_text(text: &str) -> WsResponse {
                 id,
                 ok: true,
                 printers,
+                capabilities: state.local_ledger.as_ref().map(|_| PrintCapabilities {
+                    print_intent_id: true,
+                }),
             },
             Err(e) => WsResponse::err(id, e.to_string()),
         },
@@ -457,6 +489,7 @@ async fn handle_text(text: &str) -> WsResponse {
             id,
             printer: name,
             data,
+            print_intent_id,
         } => {
             // Base64 decode + length guard. We don't trust the wire.
             let bytes = match BASE64.decode(data.as_bytes()) {
@@ -469,25 +502,114 @@ async fn handle_text(text: &str) -> WsResponse {
                     format!("payload {} > max {}", bytes.len(), MAX_PRINT_BYTES),
                 );
             }
-            match printer::print_raw(&name, &bytes) {
-                Ok(job_id) => WsResponse::PrintOk {
-                    id,
-                    ok: true,
-                    job_id,
-                },
-                Err(e) => WsResponse::err(id, e.to_string()),
-            }
+            run_print(state, id, name, bytes, print_intent_id).await
         }
         WsRequest::Test { id, printer: name } => {
             let bytes = printer::test_ticket_bytes();
-            match printer::print_raw(&name, &bytes) {
-                Ok(job_id) => WsResponse::PrintOk {
-                    id,
-                    ok: true,
+            run_print(state, id, name, bytes, None).await
+        }
+    }
+}
+
+async fn run_print(
+    state: &ServerState,
+    id: String,
+    printer_name: String,
+    bytes: Vec<u8>,
+    intent_id: Option<String>,
+) -> WsResponse {
+    let permit = match Arc::clone(&state.print_slots).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => return WsResponse::err(id, format!("local print pool closed: {error}")),
+    };
+    let state = state.clone();
+    let fallback_id = id.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Some(intent_id) = intent_id {
+            return print_with_intent(&state, id, printer_name, &bytes, intent_id);
+        }
+        match (state.print_raw)(&printer_name, &bytes) {
+            Ok(job_id) => WsResponse::PrintOk {
+                id,
+                ok: true,
+                job_id,
+                print_intent_id: None,
+            },
+            Err(error) => WsResponse::err(id, error.to_string()),
+        }
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => WsResponse::err(fallback_id, format!("local print task failed: {error}")),
+    }
+}
+
+fn print_with_intent(
+    state: &ServerState,
+    request_id: String,
+    printer_name: String,
+    bytes: &[u8],
+    intent_id: String,
+) -> WsResponse {
+    let Some(ledger) = state.local_ledger.as_ref() else {
+        return WsResponse::err(request_id, "local print intent ledger unavailable");
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"GourmelyPrint-local-intent-v1\0");
+    digest.update((printer_name.len() as u64).to_be_bytes());
+    digest.update(printer_name.as_bytes());
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    let fingerprint = format!("{:x}", digest.finalize());
+    let outcome = match ledger.claim(&intent_id, &fingerprint) {
+        Ok(Claim::Fresh) => {
+            let outcome = match (state.print_raw)(&printer_name, bytes) {
+                Ok(job_id) => Outcome {
                     job_id,
+                    error: None,
                 },
-                Err(e) => WsResponse::err(id, e.to_string()),
+                Err(error) => Outcome {
+                    job_id: 0,
+                    error: Some(error.to_string()),
+                },
+            };
+            if let Err(error) = ledger.finish(&intent_id, outcome.clone()) {
+                return WsResponse::err(request_id, error.to_string());
             }
+            outcome
+        }
+        Ok(Claim::Done(outcome)) => outcome,
+        Ok(Claim::Interrupted) => {
+            return WsResponse::err(request_id, "print intent outcome is uncertain");
+        }
+        Ok(Claim::Conflict) => {
+            return WsResponse::err(request_id, "print intent ID conflicts with prior payload");
+        }
+        Err(error) => return WsResponse::err(request_id, error.to_string()),
+    };
+    match outcome.error {
+        Some(error) => WsResponse::err(request_id, error),
+        None => WsResponse::PrintOk {
+            id: request_id,
+            ok: true,
+            job_id: outcome.job_id,
+            print_intent_id: Some(intent_id),
+        },
+    }
+}
+
+fn open_local_ledger(path: Option<PathBuf>) -> Option<Arc<LocalJobLedger>> {
+    let Some(path) = path else {
+        tracing::warn!("durable local print intents disabled: no data directory");
+        return None;
+    };
+    match LocalJobLedger::open(path) {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(error) => {
+            tracing::error!(%error, "durable local print intents disabled; legacy printing remains available");
+            None
         }
     }
 }
@@ -518,6 +640,11 @@ pub async fn serve(
         version: env!("CARGO_PKG_VERSION"),
         settings,
         relay,
+        local_ledger: open_local_ledger(
+            crate::config::data_dir().map(|dir| dir.join("local-print-intents.jsonl")),
+        ),
+        print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     };
     tracing::info!(
         mode = ?state.settings.snapshot().local_auth,
@@ -561,6 +688,9 @@ pub fn router_with_settings(settings: crate::config::Settings) -> Router {
         version: "test",
         settings: SettingsStore::in_memory(settings),
         relay: None,
+        local_ledger: None,
+        print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
 }
 
@@ -576,6 +706,9 @@ pub fn router_with_relay(relay: RelayHandle) -> Router {
             ..Default::default()
         }),
         relay: Some(relay),
+        local_ledger: None,
+        print_raw: Arc::new(printer::print_raw),
+        print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
 }
 
@@ -583,6 +716,342 @@ pub fn router_with_relay(relay: RelayHandle) -> Router {
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use crate::relay::{RelayState, RelayStatus};
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use tokio_tungstenite::{
+        tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
+    };
+
+    type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    #[tokio::test]
+    async fn health_explains_acl_repair_without_exposing_credentials() {
+        let state = ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                station_token: Some("private-token".into()),
+                ..Default::default()
+            })
+            .with_security_issue("Run the bridge once as administrator, then restart normally."),
+            relay: None,
+            local_ledger: None,
+            print_raw: Arc::new(printer::print_raw),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+        let body = serde_json::to_value(health_handler(State(state)).await.0).unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["configuration_security"]
+            .as_str()
+            .unwrap()
+            .contains("administrator"));
+        assert!(!body.to_string().contains("private-token"));
+    }
+
+    #[test]
+    fn health_explains_a_saved_plaintext_endpoint_requires_repairing() {
+        let status = RelayStatus {
+            state: RelayState::EndpointInsecure,
+            paired: true,
+            last_error: Some(
+                "Dirección del servidor insegura: usa HTTPS; vuelve a vincular la estación.".into(),
+            ),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(HealthRelay::from_status(status)).expect("health JSON");
+        assert_eq!(body["state"], "endpoint-insecure");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["needs_attention"], true);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HTTPS"));
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vincular"));
+    }
+
+    async fn ws_exchange(
+        socket: &mut ClientSocket,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        socket
+            .send(ClientMessage::Text(request.to_string().into()))
+            .await
+            .expect("send request");
+        let response = socket.next().await.expect("response frame").expect("frame");
+        serde_json::from_str(&response.into_text().expect("text response")).expect("json response")
+    }
+
+    async fn ws_test_server(state: ServerState) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let url = format!("ws://{}/print", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, build_router(state))
+                .await
+                .expect("serve test socket");
+        });
+        (server, url)
+    }
+
+    #[tokio::test]
+    async fn intent_capability_and_ack_are_durable_without_changing_legacy_prints() {
+        let path = std::env::temp_dir()
+            .join(format!("bridge-wss-intent-{}", uuid::Uuid::new_v4()))
+            .join("local-print-intents.jsonl");
+        let printed = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = {
+            let printed = Arc::clone(&printed);
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_printer: &str, bytes: &[u8]| {
+                printed.lock().unwrap().push(bytes.to_vec());
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(73)
+            })
+        };
+        let make_state = |ledger| ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                local_auth: LocalAuth::Off,
+                ..Default::default()
+            }),
+            relay: None,
+            local_ledger: ledger,
+            print_raw: fake.clone(),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+
+        let first_ledger = Arc::new(crate::local_job_ledger::LocalJobLedger::open(&path).unwrap());
+        let (server, url) = ws_test_server(make_state(Some(Arc::clone(&first_ledger)))).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect first socket");
+        let list = ws_exchange(&mut socket, serde_json::json!({"op":"list","id":"list-1"})).await;
+        assert_eq!(list["capabilities"]["printIntentId"], true);
+        assert_eq!(list["id"], "list-1");
+        let data = BASE64.encode(b"\x1b@\xff");
+        let first = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"attempt-1", "printer":"Fake", "data":data,
+                "printIntentId":"intent-stable"
+            }),
+        )
+        .await;
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["id"], "attempt-1");
+        assert_eq!(first["printIntentId"], "intent-stable");
+        assert_eq!(first["jobId"], 73);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        socket.close(None).await.unwrap();
+        drop(socket);
+        server.abort();
+        let _ = server.await;
+        drop(first_ledger);
+
+        // Axum's upgraded socket outlives this test's aborted listener and
+        // briefly retains its ServerState clone. Production opens this ledger
+        // once per process in lib.rs; pair/unpair and WS reconnect reuse it.
+        let reopened = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match LocalJobLedger::open(&path) {
+                    Ok(ledger) => break Arc::new(ledger),
+                    Err(BridgeError::AlreadyRunning(_)) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("reopen local ledger: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("first socket releases local ledger");
+        let (server, url) = ws_test_server(make_state(Some(reopened))).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect after restart");
+        let retry = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"attempt-2", "printer":"Fake", "data":data,
+                "printIntentId":"intent-stable"
+            }),
+        )
+        .await;
+        assert_eq!(retry["id"], "attempt-2");
+        assert_eq!(retry["ok"], true);
+        assert_eq!(retry["printIntentId"], "intent-stable");
+        assert_eq!(retry["jobId"], 73);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let collision = ws_exchange(&mut socket, serde_json::json!({
+            "op":"print", "id":"attempt-3", "printer":"Fake", "data":BASE64.encode(b"different"),
+            "printIntentId":"intent-stable"
+        })).await;
+        assert_eq!(collision["ok"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let legacy = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"legacy", "printer":"Fake", "data":data
+            }),
+        )
+        .await;
+        assert_eq!(legacy["ok"], true);
+        assert!(legacy.get("printIntentId").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*printed.lock().unwrap(), vec![b"\x1b@\xff".to_vec(); 2]);
+        server.abort();
+
+        // A directory at the ledger path simulates failed startup storage.
+        let unavailable = open_local_ledger(Some(path.parent().unwrap().to_path_buf()));
+        assert!(unavailable.is_none());
+        let (server, url) = ws_test_server(make_state(unavailable)).await;
+        let health_url = url.replace("ws://", "http://").replace("/print", "/health");
+        let health: serde_json::Value = reqwest::get(health_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["ok"], true);
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect legacy-only socket");
+        let list = ws_exchange(
+            &mut socket,
+            serde_json::json!({"op":"list","id":"legacy-list"}),
+        )
+        .await;
+        assert!(list.get("capabilities").is_none());
+        let unsupported = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"unsupported", "printer":"Fake", "data":data,
+                "printIntentId":"intent-stable"
+            }),
+        )
+        .await;
+        assert_eq!(unsupported["ok"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let legacy = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print", "id":"legacy-after-ledger-failure", "printer":"Fake", "data":data
+            }),
+        )
+        .await;
+        assert_eq!(legacy["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_local_spooler_does_not_delay_health_or_another_socket() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        for mode in ["legacy", "intent", "test"] {
+            let entered = Arc::new(AtomicBool::new(false));
+            let fake = {
+                let entered = Arc::clone(&entered);
+                Arc::new(move |_printer: &str, _bytes: &[u8]| {
+                    entered.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(91)
+                })
+            };
+            let ledger = if mode == "intent" {
+                let path = std::env::temp_dir()
+                    .join(format!("bridge-blocked-spooler-{}", uuid::Uuid::new_v4()))
+                    .join("local-print-intents.jsonl");
+                Some(Arc::new(LocalJobLedger::open(path).unwrap()))
+            } else {
+                None
+            };
+            let state = ServerState {
+                started_at: Instant::now(),
+                version: "test",
+                settings: SettingsStore::in_memory(Settings {
+                    local_auth: LocalAuth::Off,
+                    ..Default::default()
+                }),
+                relay: None,
+                local_ledger: ledger,
+                print_raw: fake,
+                print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+            };
+            let (server, url) = ws_test_server(state).await;
+            let (mut first, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            let health_url = url.replace("ws://", "http://").replace("/print", "/health");
+            let watcher_url = url.clone();
+            let watcher = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !entered.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline, "spooler never started");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let started = Instant::now();
+                    let health: serde_json::Value = reqwest::get(health_url)
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let (mut second, _) = tokio_tungstenite::connect_async(&watcher_url)
+                        .await
+                        .unwrap();
+                    let list = ws_exchange(
+                        &mut second,
+                        serde_json::json!({"op":"list","id":"another-socket"}),
+                    )
+                    .await;
+                    (started.elapsed(), health, list)
+                })
+            });
+            let request = match mode {
+                "intent" => serde_json::json!({
+                    "op":"print", "id":"blocked", "printer":"Fake",
+                    "data":BASE64.encode(b"ticket"), "printIntentId":"blocked-intent"
+                }),
+                "test" => serde_json::json!({"op":"test","id":"blocked","printer":"Fake"}),
+                _ => serde_json::json!({
+                    "op":"print", "id":"blocked", "printer":"Fake",
+                    "data":BASE64.encode(b"ticket")
+                }),
+            };
+            let printing = tokio::spawn(async move { ws_exchange(&mut first, request).await });
+            tokio::task::yield_now().await;
+            let (elapsed, health, list) =
+                tokio::task::spawn_blocking(move || watcher.join().unwrap())
+                    .await
+                    .unwrap();
+            assert_eq!(health["ok"], true, "{mode}");
+            assert_eq!(list["ok"], true, "{mode}");
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{mode} blocked other requests for {elapsed:?}"
+            );
+            let printed = printing.await.unwrap();
+            assert_eq!(printed["ok"], true, "{mode}");
+            assert_eq!(printed["jobId"], 91, "{mode}");
+            server.abort();
+        }
+    }
 
     fn headers(origin: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -605,6 +1074,9 @@ mod tests {
                 ..Default::default()
             }),
             relay: None,
+            local_ledger: None,
+            print_raw: Arc::new(printer::print_raw),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         }
     }
 

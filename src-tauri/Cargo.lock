@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "print-bridge"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -3115,6 +3115,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -3130,6 +3131,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots 1.0.7",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

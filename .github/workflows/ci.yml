@@ -77,6 +77,12 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Check release metadata
+        run: npm run test:version
+
+      - name: Check UI security policy
+        run: npm run test:csp
+
       - name: cargo fmt
         working-directory: src-tauri
         run: cargo fmt --all -- --check
@@ -94,3 +100,30 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --all-targets
+
+  ui-security:
+    name: deterministic browser security tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx @e2e-dev/web install chromium --with-deps
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check UI rendering in browser
+        run: npm run test:e2e

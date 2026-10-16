@@ -1,6 +1,6 @@
 [package]
 name = "print-bridge"
-version = "0.1.4"
+version = "0.1.6"
 description = "Local print bridge for GourmelyHub POS — open source replacement for QZ Tray"
 authors = ["GourmelyHub <contacto@busticco.com>"]
 edition = "2021"
@@ -40,6 +40,8 @@ thiserror = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# Collision-resistant identity for local print-intent deduplication.
+sha2 = "=0.10.9"
 # CSPRNG for the local WSS secret. Explicit dependency rather than borrowing
 # `uuid`'s: this value is a bearer credential and the source of its entropy
 # should be visible in the manifest.
@@ -78,6 +80,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # process-level CryptoProvider".
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 rustls-pemfile = "2"
+# Reuse the root bundle already locked by the outbound rustls clients to
+# validate local certificate overrides before serving them.
+webpki-roots = "=1.0.7"
 
 # Logs
 tracing = "0.1"
@@ -107,6 +112,11 @@ printers = "2"
 # a dependency of every platform.
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
+
+[target.'cfg(windows)'.dependencies]
+# NTFS ACLs and the active console/RDP user are Windows-only. This version is
+# already in Cargo.lock through Tauri; a direct edge enables our own imports.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
 
 [dev-dependencies]
 axum-test = "16"
