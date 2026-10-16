@@ -393,7 +393,9 @@ impl SettingsStore {
                             // It just has to be re-issued on the next boot.
                             tracing::error!(err = %e, "could not persist the generated local secret");
                             #[cfg(windows)]
-                            security_issue = Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string());
+                            {
+                                security_issue = Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string());
+                            }
                         }
                     }
                 }
