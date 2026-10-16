@@ -153,6 +153,7 @@ or printer; they do not replace a packaged WebView/MSI smoke test.
 ```bash
 npm run test:e2e
 npm run test:csp
+npm run test:version
 ```
 
 ## Releases (maintainers)
@@ -166,7 +167,9 @@ so customers always get the newest build from a single direct-download
 link — they never browse this repo.
 
 ```bash
-# 1. Bump version in src-tauri/tauri.conf.json AND src-tauri/Cargo.toml
+# 1. Bump Tauri/Cargo metadata with ops/bump-version.py --set X.Y.Z;
+#    bump package.json with npm pkg set version=X.Y.Z and refresh package-lock.json.
+#    Confirm all six version values with npm run test:version.
 # 2. Commit + merge to main
 # 3. Tag + push:
 git tag v0.1.1

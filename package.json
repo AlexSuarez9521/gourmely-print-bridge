@@ -1,13 +1,14 @@
 {
   "name": "print-bridge",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.6",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "test:e2e": "tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --skipLibCheck tests/ui-security.e2e.ts e2e.config.ts && e2e run tests/ui-security.e2e.ts",
     "test:csp": "node --test tests/csp.test.mjs",
+    "test:version": "node --test tests/version.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
