@@ -22,6 +22,7 @@ pub mod engineio;
 pub mod error;
 pub mod instance_lock;
 pub mod job_ledger;
+pub mod local_job_ledger;
 pub mod pairing;
 pub mod printer;
 pub mod relay;
