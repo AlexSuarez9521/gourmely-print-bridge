@@ -70,15 +70,25 @@ fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
         .filter_map(|ace| ace.split(')').next())
         .filter_map(|ace| ace.rsplit(";;;").next())
         .collect();
+    // Windows serializes the local Administrator RID-500 SID as the SDDL
+    // well-known alias LA, even when the ACE was created from its numeric SID.
+    let expected_user = if user_sid.ends_with("-500") {
+        "LA"
+    } else if user_sid == "S-1-5-18" {
+        "SY"
+    } else {
+        user_sid
+    };
     assert!(!trustees.is_empty(), "empty DACL: {sddl}");
     for &trustee in &trustees {
         assert!(
-            trustee == user_sid || matches!(trustee, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544"),
+            trustee == expected_user
+                || matches!(trustee, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544"),
             "unexpected ACL trustee {trustee}: {sddl}"
         );
     }
     assert!(
-        trustees.contains(&user_sid),
+        trustees.contains(&expected_user),
         "current user has no explicit access: {sddl}"
     );
 }

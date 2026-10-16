@@ -728,6 +728,30 @@ mod tests {
 
     type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+    #[tokio::test]
+    async fn health_explains_acl_repair_without_exposing_credentials() {
+        let state = ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                station_token: Some("private-token".into()),
+                ..Default::default()
+            })
+            .with_security_issue("Run the bridge once as administrator, then restart normally."),
+            relay: None,
+            local_ledger: None,
+            print_raw: Arc::new(printer::print_raw),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+        let body = serde_json::to_value(health_handler(State(state)).await.0).unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["configuration_security"]
+            .as_str()
+            .unwrap()
+            .contains("administrator"));
+        assert!(!body.to_string().contains("private-token"));
+    }
+
     #[test]
     fn health_explains_a_saved_plaintext_endpoint_requires_repairing() {
         let status = RelayStatus {

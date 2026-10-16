@@ -176,6 +176,15 @@ automatically once the `WINDOWS_CODE_SIGN_PFX_BASE64` secret is set.
 The committed TLS private key is safe by design — see
 [SECURITY.md](SECURITY.md).
 
+On Windows, the bridge protects `%PROGRAMDATA%\GourmelyPrint` and existing
+config/print-ledger files for the active console or RDP user, SYSTEM, and
+Administrators. If a legacy ACL cannot be repaired, a readable config remains
+available but settings writes stop; `/health.configuration_security` and the
+status panel explain the repair. With the cashier session active, close the
+bridge, run the installed bridge once as Administrator, close that elevated
+instance, and start it normally. Check that `/health.configuration_security`
+is `null` before pairing or changing settings; do not edit tokens by hand.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

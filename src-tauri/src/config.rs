@@ -355,7 +355,7 @@ impl SettingsStore {
         let acl_error = acl.as_ref().err().map(|e| e.to_string());
         let acl_user_sid = acl.ok();
         let security_issue = if unreadable || acl_error.is_some() {
-            Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string())
+            Some("La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.".to_string())
         } else {
             None
         };
@@ -394,7 +394,7 @@ impl SettingsStore {
                             tracing::error!(err = %e, "could not persist the generated local secret");
                             #[cfg(windows)]
                             {
-                                security_issue = Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string());
+                                security_issue = Some("La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.".to_string());
                             }
                         }
                     }
@@ -429,6 +429,12 @@ impl SettingsStore {
 
     pub fn security_issue(&self) -> Option<&str> {
         self.security_issue.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_security_issue(mut self, detail: &str) -> Self {
+        self.security_issue = Some(detail.to_string());
+        self
     }
 
     /// A snapshot. Callers get a clone rather than a guard so a slow consumer
