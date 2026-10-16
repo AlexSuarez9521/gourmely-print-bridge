@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:e2e": "tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --skipLibCheck tests/ui-security.e2e.ts e2e.config.ts && e2e run tests/ui-security.e2e.ts",
+    "test:csp": "node --test tests/csp.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -16,8 +18,11 @@
     "@tauri-apps/plugin-updater": "^2"
   },
   "devDependencies": {
+    "@e2e-dev/web": "^0.15.1",
     "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
-    "typescript": "~5.6.2"
+    "@types/node": "^26.6.5",
+    "e2e": "^0.21.1",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
   }
 }

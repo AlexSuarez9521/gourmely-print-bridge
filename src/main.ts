@@ -318,10 +318,13 @@ async function refreshPrinterList() {
   try {
     const printers = await invoke<string[]>('list_printers');
     if (printers.length === 0) {
-      list.innerHTML = '<li class="printer-empty">Sin impresoras instaladas</li>';
+      const empty = document.createElement('li');
+      empty.className = 'printer-empty';
+      empty.textContent = 'Sin impresoras instaladas';
+      list.replaceChildren(empty);
       return;
     }
-    list.innerHTML = '';
+    list.replaceChildren();
     for (const name of printers) {
       const li = document.createElement('li');
       li.className = 'printer-item';
@@ -337,7 +340,10 @@ async function refreshPrinterList() {
       list.appendChild(li);
     }
   } catch (e) {
-    list.innerHTML = `<li class="printer-empty">Error: ${String(e)}</li>`;
+    const error = document.createElement('li');
+    error.className = 'printer-empty';
+    error.textContent = `Error: ${String(e)}`;
+    list.replaceChildren(error);
   }
 }
 
@@ -415,38 +421,39 @@ function showUpdateBanner(update: Update) {
     banner.className = 'update-banner';
     document.body.prepend(banner);
   }
-  banner.innerHTML = `
-    <span class="update-text">Nueva versión ${update.version} disponible.</span>
-    <button class="btn-primary" id="update-install">Instalar y reiniciar</button>
-    <button class="btn-ghost" id="update-later">Después</button>
-  `;
+  const message = document.createElement('span');
+  message.className = 'update-text';
+  message.textContent = `Nueva versión ${update.version} disponible.`;
+  const installBtn = document.createElement('button');
+  installBtn.className = 'btn-primary';
+  installBtn.id = 'update-install';
+  installBtn.textContent = 'Instalar y reiniciar';
+  const laterBtn = document.createElement('button');
+  laterBtn.className = 'btn-ghost';
+  laterBtn.id = 'update-later';
+  laterBtn.textContent = 'Después';
+  banner.replaceChildren(message, installBtn, laterBtn);
 
-  document.getElementById('update-later')?.addEventListener('click', () => {
-    banner?.remove();
+  laterBtn.addEventListener('click', () => {
+    banner.remove();
   });
 
-  document.getElementById('update-install')?.addEventListener('click', async () => {
-    const installBtn = document.getElementById('update-install') as HTMLButtonElement | null;
-    const laterBtn = document.getElementById('update-later') as HTMLButtonElement | null;
-    if (installBtn) {
-      installBtn.disabled = true;
-      installBtn.textContent = 'Descargando…';
-    }
-    if (laterBtn) laterBtn.disabled = true;
+  installBtn.addEventListener('click', async () => {
+    installBtn.disabled = true;
+    installBtn.textContent = 'Descargando…';
+    laterBtn.disabled = true;
     try {
       // downloadAndInstall streams progress events; we keep the UI
       // simple and just flip the label. On Windows the MSI installer
       // runs and the app exits, so relaunch() resumes it.
       await update.downloadAndInstall();
-      if (installBtn) installBtn.textContent = 'Reiniciando…';
+      installBtn.textContent = 'Reiniciando…';
       await relaunch();
     } catch (e) {
       console.error('update install failed', e);
-      if (installBtn) {
-        installBtn.disabled = false;
-        installBtn.textContent = 'Reintentar';
-      }
-      if (laterBtn) laterBtn.disabled = false;
+      installBtn.disabled = false;
+      installBtn.textContent = 'Reintentar';
+      laterBtn.disabled = false;
     }
   });
 }

@@ -146,6 +146,15 @@ which is also how you inspect what actually came out.
 cargo test --test relay_e2e -- --ignored --nocapture
 ```
 
+UI security tests run against Vite with mocked Tauri IPC and the configured
+production CSP as a browser response header. They need no model key, backend,
+or printer; they do not replace a packaged WebView/MSI smoke test.
+
+```bash
+npm run test:e2e
+npm run test:csp
+```
+
 ## Releases (maintainers)
 
 `.github/workflows/release.yml` builds and publishes the MSI on every
