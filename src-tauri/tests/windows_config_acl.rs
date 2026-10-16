@@ -70,6 +70,12 @@ fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
         .filter_map(|ace| ace.split(')').next())
         .filter_map(|ace| ace.rsplit(";;;").next())
         .collect();
+    // OWNER RIGHTS removes the implicit WRITE_DAC held by a legacy owner.
+    // Without it, an old account could silently grant itself access again.
+    assert!(
+        dacl.contains("(A;;RC;;;OW)") || dacl.contains("(A;OICI;RC;;;OW)"),
+        "legacy owner can still rewrite the DACL: {sddl}"
+    );
     // Windows serializes the local Administrator RID-500 SID as the SDDL
     // well-known alias LA, even when the ACE was created from its numeric SID.
     let expected_user = if user_sid.ends_with("-500") {
@@ -83,7 +89,7 @@ fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
     for &trustee in &trustees {
         assert!(
             trustee == expected_user
-                || matches!(trustee, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544"),
+                || matches!(trustee, "SY" | "BA" | "OW" | "S-1-5-18" | "S-1-5-32-544"),
             "unexpected ACL trustee {trustee}: {sddl}"
         );
     }
