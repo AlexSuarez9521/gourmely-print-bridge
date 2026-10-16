@@ -113,6 +113,11 @@ printers = "2"
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
 
+[target.'cfg(windows)'.dependencies]
+# NTFS ACLs and the active console/RDP user are Windows-only. This version is
+# already in Cargo.lock through Tauri; a direct edge enables our own imports.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
+
 [dev-dependencies]
 axum-test = "16"
 
