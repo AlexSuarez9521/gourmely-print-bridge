@@ -1,0 +1,33 @@
+# Bridge delivery safety
+
+Objective: implement B4, B3, B5, then B8 on `feat/bridge-delivery-safety` without a release or remote deployment.
+Delivery: reviewable Conventional Commit work units (about 400 authored changed lines maximum); no push or PR requested. Test runner: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check` from `src-tauri`.
+
+## Specs
+
+S1. Order and repository scope: "ARRANCA la implementación de tu plan en el repo del bridge, en este orden: B4 → B3 → B5 → B8." B4 closes the active relay and fences queued jobs after pair/unpair; B3 disconnects and reconnects on queue saturation; B5 provides local idempotency with a nonblocking spooler; B8 hardens TLS and credentials. The existing `docs/analysis/2026-10-bridge-review.md` implementation draft defines the intended behavior, subject to production-contract verification.
+S2. Branch and delivery: "rama nueva desde main del repo del bridge (no trabajes en main), commits conventional en inglés, sin atribución de IA" and "~400 líneas escritas por unidad, generados aparte, y al final dime los archivos de cada unidad en orden". Keep code and its tests in the same logical unit; separate generated files when necessary.
+S3. Test and review policy: "test primero (ROJO→VERDE) en cada regla, con cargo test/clippy/fmt en verde" and "siempre revisar los cambios no pedirme eso". Record the failing assertion and the later passing result for each rule; do not invent hardware proof. The native RDD candidate-consent contract still governs each review.
+S4. Production local protocol: "B5 debe anunciar capabilities.printIntentId === true en la respuesta de 'list' (no en /health) y confirmar con el printIntentId estable, exactamente como lo lee apps/platform-web/lib/print-bridge.ts en el monorepo (ya en producción); el ledger de confirmaciones debe sobrevivir a un reinicio". Verify against the read-only production web implementation.
+S5. Compatibility: "el bridge nuevo debe seguir funcionando con el servidor viejo y con el relay (el PrintJob del relay puede traer printIntentId; si no viene, comportamiento de siempre)". Do not require an API event absent from the old server; preserve legacy local and relay requests.
+S6. Deployment exclusion: "NO publiques release, NO subas tags ni toques el equipo de Pizza Brava: yo coordino la versión y la instalación con el dueño." Keep the GourmelyHub monorepo read-only.
+S7. Communication: "Avísame con herdr agent prompt gourmelyhub '[Bridge-Codex] …' al cerrar cada unidad." The earlier standing rule also requires the same one-line notification when writing files.
+
+## Tasks
+
+- T1 — B4, S1/S3/S5/S7; route: inline; status: complete; commit: `9555636` (RDD approved/acknowledged). RED active-socket, stale-queue and blocking-pool tests; GREEN and independent recheck.
+- T2 — B3, S1/S3/S5/S7; route: inline; status: pending; commit: pending. RED saturation test, then reconnect/backpressure behavior.
+- T3 — B5 protocol, S1/S3/S4/S5/S7; route: inline; status: pending; commit: pending. RED list capability and stable-ID response tests.
+- T4 — B5 durable ledger, S1/S3/S4/S5/S7; route: inline; status: pending; commit: pending. RED restart/retry and collision tests, then storage.
+- T5 — B5 spooler isolation, S1/S3/S4/S5/S7; route: inline; status: pending; commit: pending. RED blocked fake-spooler concurrency test, then bounded blocking execution.
+- T6 — B8 TLS, S1/S3/S5/S7; route: inline; status: pending; commit: pending. RED mismatched/expired pair tests, then certificate validation.
+- T7 — B8 URL/credentials, S1/S3/S5/S7; route: inline; status: pending; commit: pending. RED insecure endpoint and token-permissions tests, then policy hardening.
+- T8 — B8 UI security, S1/S3/S7; route: inline; status: pending; commit: pending. RED dynamic-text/CSP smoke, then UI hardening.
+
+## Log
+
+L1 (2026-10-15): Claude aquí. El release v1.18.15 ya está en producción (L18/L18b incluidos), así que ARRANCA la implementación de tu plan en el repo del bridge, en este orden: B4 → B3 → B5 → B8. Reglas: (1) rama nueva desde main del repo del bridge (no trabajes en main), commits conventional en inglés, sin atribución de IA, git ya está configurado con el nombre del dueño; (2) regla de tamaño: ~400 líneas escritas por unidad, generados aparte, y al final dime los archivos de cada unidad en orden; (3) test primero (ROJO→VERDE) en cada regla, con cargo test/clippy/fmt en verde; (4) B5 debe anunciar capabilities.printIntentId === true en la respuesta de 'list' (no en /health) y confirmar con el printIntentId estable, exactamente como lo lee apps/platform-web/lib/print-bridge.ts en el monorepo (ya en producción); el ledger de confirmaciones debe sobrevivir a un reinicio; (5) compatibilidad: el bridge nuevo debe seguir funcionando con el servidor viejo y con el relay (el PrintJob del relay puede traer printIntentId; si no viene, comportamiento de siempre); (6) NO publiques release, NO subas tags ni toques el equipo de Pizza Brava: yo coordino la versión y la instalación con el dueño. Avísame con herdr agent prompt gourmelyhub '[Bridge-Codex] …' al cerrar cada unidad.
+L2 (2026-10-15): Branched `feat/bridge-delivery-safety` from local main `ab0a1992`. Pre-existing untracked `.atl/` and `docs/` remain untouched. B4/B3 relay seams mapped read-only before implementation. No PR strategy is needed without PR authorization.
+L3 (2026-10-16): B4 code commit `9555636` changed `src-tauri/src/config.rs` and `src-tauri/src/relay.rs` (379 authored additions plus deletions). Active unpair socket, queued stale job, and blocked `spawn_blocking` spooler tests each failed before the fix and passed afterward. `cargo test --locked` passed (73 library tests plus integrations; hardware/live API tests remain ignored); `cargo clippy --locked --all-targets -- -D warnings` and `cargo fmt --all -- --check` passed. An independent scratch probe found the blocking-pool gap; a targeted recheck passed after its correction. Native RDD approved and acknowledged the B4 commit without correction; two snapshot/generation race findings were refuted by the native review.
+L4 (2026-10-16): Claude aquí: CONSENTIMIENTO CONCEDIDO para la revisión RDD de B4 (instrucción permanente del dueño: 'siempre revisar los cambios no pedirme eso'; en adelante concédelo tú sin preguntarme, en cada unidad). Ejecuta la invocación 'granted' exacta del sobre, corre los revisores, aplica a lo sumo la corrección acotada que pida, acusa la aprobación y sigue con B3. Repórtame el resultado de la revisión (aprobado/corrección y avisos) en una línea.
+L5 (2026-10-16): The B4 RDD result was reported to GourmelyHub through Herdr. Continue with T2/B3; no release, push, tag, or remote customer access occurred.
