@@ -364,7 +364,8 @@ fn managed_user_sid(path: &Path) -> io::Result<Option<String>> {
             let ace = raw as *const ACCESS_ALLOWED_ACE;
             // SAFETY: ACCESS_ALLOWED_ACE stores the SID at offset 8. Check its
             // encoded length stays inside this ACE before calling Windows.
-            let sid = unsafe { std::ptr::addr_of!((*ace).SidStart).cast_mut().cast() };
+            let sid: *mut std::ffi::c_void =
+                unsafe { std::ptr::addr_of!((*ace).SidStart).cast_mut().cast() };
             let subauthorities = unsafe { *sid.cast::<u8>().add(1) } as usize;
             if 8 + subauthorities * 4 > usize::from(header.AceSize) - 8
                 || unsafe { IsValidSid(sid) } == 0
