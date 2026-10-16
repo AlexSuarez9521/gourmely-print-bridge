@@ -186,6 +186,12 @@ bridge, run the installed bridge once as Administrator, close that elevated
 instance, and start it normally. Check that `/health.configuration_security`
 is `null` before pairing or changing settings; do not edit tokens by hand.
 
+If the status instead reports damaged `config.json`, elevation alone cannot
+repair invalid JSON. Stop the bridge and make a restricted-access backup of
+`%PROGRAMDATA%\GourmelyPrint\config.json`; restore a known-good copy or
+rename the damaged file, then restart and re-pair the station. The bridge
+does not overwrite the damaged file while reporting this error.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
