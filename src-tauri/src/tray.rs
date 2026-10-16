@@ -118,6 +118,9 @@ pub fn tooltip_for(status: &RelayStatus) -> String {
             "NO PUEDE IMPRIMIR — no logra escribir su registro en este equipo".to_string()
         }
         RelayState::Rejected => "Estación rechazada — vuelve a vincularla".to_string(),
+        RelayState::EndpointInsecure => {
+            "SERVIDOR INSEGURO — configura HTTPS y vuelve a vincular la estación".to_string()
+        }
         RelayState::Connected => match status.label.as_deref() {
             Some(label) => format!("Conectado — {label}"),
             None => "Conectado".to_string(),
@@ -325,5 +328,17 @@ mod tests {
                 "{state:?} was hidden behind the pairing hint"
             );
         }
+    }
+
+    #[test]
+    fn an_insecure_saved_endpoint_is_not_called_reconnecting() {
+        let status = RelayStatus {
+            state: RelayState::EndpointInsecure,
+            paired: true,
+            ..Default::default()
+        };
+        let tip = tooltip_for(&status);
+        assert!(tip.contains("vincular"), "{tip}");
+        assert!(!tip.contains("Reconectando"), "{tip}");
     }
 }

@@ -95,6 +95,46 @@ pub const MAX_PRINT_BYTES: usize = 1_024 * 1_024;
 /// Where the relay points when nobody has said otherwise.
 pub const DEFAULT_SERVER_URL: &str = "https://api-gourmelyhub.busticco.com";
 
+/// A station credential may only leave over TLS. Plaintext is useful for an
+/// explicitly local simulator, but a hostname that merely starts with
+/// `localhost` is not local. Return a canonical base URL for both pairing and
+/// the outbound relay so persisted settings cannot bypass the pairing check.
+pub fn validated_server_url(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Falta la dirección del servidor de GourmelyHub.".into());
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let url = reqwest::Url::parse(&candidate)
+        .map_err(|_| "La dirección del servidor no es una URL válida.".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "La dirección del servidor necesita un host.".to_string())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "La dirección del servidor no puede incluir credenciales ni parámetros.".into(),
+        );
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err("Usa HTTPS para servidores remotos; HTTP solo se permite en localhost.".into());
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
 /// How the local WSS decides whether a caller may print.
 ///
 /// # Why three modes and not a boolean
@@ -348,6 +388,35 @@ mod tests {
         assert_eq!(s.server_url(), "https://api.example.com");
         s.server_url = Some("   ".into());
         assert_eq!(s.server_url(), DEFAULT_SERVER_URL);
+    }
+
+    #[test]
+    fn station_endpoint_requires_tls_except_for_explicit_loopback() {
+        for (input, expected) in [
+            ("https://api.example.com/", "https://api.example.com"),
+            (" api.example.com ", "https://api.example.com"),
+            ("http://localhost:3000/", "http://localhost:3000"),
+            ("http://127.0.0.1:3000/", "http://127.0.0.1:3000"),
+            ("http://[::1]:3000/", "http://[::1]:3000"),
+        ] {
+            assert_eq!(
+                validated_server_url(input).as_deref(),
+                Ok(expected),
+                "{input}"
+            );
+        }
+        for input in [
+            "http://api.example.com",
+            "http://192.0.2.1",
+            "http://localhost.evil",
+            "https://user:pass@api.example.com",
+            "https://api.example.com?token=secret",
+            "https://api.example.com#fragment",
+            "ftp://api.example.com",
+            "",
+        ] {
+            assert!(validated_server_url(input).is_err(), "accepted {input}");
+        }
     }
 
     #[test]

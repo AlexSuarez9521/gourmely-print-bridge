@@ -223,7 +223,7 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct HealthRelay {
     /// `connected` · `connecting` · `rejected` · `standby` ·
-    /// `ledger-unavailable` · `unpaired` · `unknown`.
+    /// `endpoint-insecure` · `ledger-unavailable` · `unpaired` · `unknown`.
     state: String,
     /// Can the server route a ticket to this till right now? This is the field
     /// that answers the question the top-level `ok` was being asked.
@@ -259,6 +259,10 @@ impl HealthRelay {
                 jobs_failed: 0,
             };
         };
+        Self::from_status(status)
+    }
+
+    fn from_status(status: crate::relay::RelayStatus) -> Self {
         Self {
             state: status.state.as_str().to_string(),
             ok: status.state.is_serving(),
@@ -709,6 +713,7 @@ pub fn router_with_relay(relay: RelayHandle) -> Router {
 mod tests {
     use super::*;
     use crate::config::Settings;
+    use crate::relay::{RelayState, RelayStatus};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -719,6 +724,30 @@ mod tests {
     };
 
     type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    #[test]
+    fn health_explains_a_saved_plaintext_endpoint_requires_repairing() {
+        let status = RelayStatus {
+            state: RelayState::EndpointInsecure,
+            paired: true,
+            last_error: Some(
+                "Dirección del servidor insegura: usa HTTPS; vuelve a vincular la estación.".into(),
+            ),
+            ..Default::default()
+        };
+        let body = serde_json::to_value(HealthRelay::from_status(status)).expect("health JSON");
+        assert_eq!(body["state"], "endpoint-insecure");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["needs_attention"], true);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HTTPS"));
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vincular"));
+    }
 
     async fn ws_exchange(
         socket: &mut ClientSocket,

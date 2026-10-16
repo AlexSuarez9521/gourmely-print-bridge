@@ -76,6 +76,7 @@ fn every_state_has_a_label_in_the_settings_window() {
         "connecting",
         "connected",
         "rejected",
+        "endpoint-insecure",
         "standby",
         "ledger-unavailable",
     ];

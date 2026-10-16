@@ -64,7 +64,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::config::{SettingsStore, MAX_PRINT_BYTES};
+use crate::config::{validated_server_url, SettingsStore, MAX_PRINT_BYTES};
 use crate::engineio::{self, Incoming};
 use crate::error::{BridgeError, BridgeResult};
 use crate::job_ledger::{Claim, JobLedger};
@@ -176,6 +176,8 @@ pub enum RelayState {
     Connected,
     /// The server refused the station token. Fixed from the GourmelyHub panel.
     Rejected,
+    /// Saved endpoint cannot safely carry the station token. Re-pair with HTTPS.
+    EndpointInsecure,
     /// Another copy of the bridge on this machine holds the print ledger, so
     /// this one stands down. Fixed by closing that copy.
     Standby,
@@ -193,6 +195,7 @@ impl RelayState {
         Self::Connecting,
         Self::Connected,
         Self::Rejected,
+        Self::EndpointInsecure,
         Self::Standby,
         Self::LedgerUnavailable,
     ];
@@ -208,6 +211,7 @@ impl RelayState {
             Self::Connecting => "connecting",
             Self::Connected => "connected",
             Self::Rejected => "rejected",
+            Self::EndpointInsecure => "endpoint-insecure",
             Self::Standby => "standby",
             Self::LedgerUnavailable => "ledger-unavailable",
         }
@@ -223,7 +227,7 @@ impl RelayState {
     pub fn needs_a_human(self) -> bool {
         matches!(
             self,
-            Self::Rejected | Self::Standby | Self::LedgerUnavailable
+            Self::Rejected | Self::EndpointInsecure | Self::Standby | Self::LedgerUnavailable
         )
     }
 }
@@ -281,7 +285,10 @@ impl RelayStatus {
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "Sin conexión con GourmelyHub; reintentando.".to_string()),
-            RelayState::Rejected | RelayState::Standby | RelayState::LedgerUnavailable => self
+            RelayState::Rejected
+            | RelayState::EndpointInsecure
+            | RelayState::Standby
+            | RelayState::LedgerUnavailable => self
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "El bridge no puede recibir impresiones remotas.".to_string()),
@@ -554,6 +561,9 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
     let mut attempt: u32 = 0;
 
     'supervise: loop {
+        // Subscribe before snapshotting: a re-pair between validation and the
+        // wait must still wake an endpoint previously rejected as unsafe.
+        let mut pairing = handle.pairing.subscribe();
         let settings = handle.settings.snapshot();
         let generation = handle.generation();
         let Some(token) = settings.station_token.clone() else {
@@ -567,9 +577,28 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
             continue;
         };
 
-        let url = engineio::websocket_url(&settings.server_url());
+        let base = match validated_server_url(&settings.server_url()) {
+            Ok(base) => base,
+            Err(reason) => {
+                handle.fail(
+                    RelayState::EndpointInsecure,
+                    format!("Dirección del servidor insegura: {reason} Corrígela en Ajustes y vuelve a vincular la estación."),
+                );
+                let _ = pairing.changed().await;
+                attempt = 0;
+                continue;
+            }
+        };
+        let url = engineio::websocket_url(&base);
         tracing::info!(url = %url, "relay connecting");
-        handle.set_state(RelayState::Connecting);
+        if handle.status().state == RelayState::EndpointInsecure {
+            handle.mutate(|s| {
+                s.state = RelayState::Connecting;
+                s.last_error = None;
+            });
+        } else {
+            handle.set_state(RelayState::Connecting);
+        }
 
         let started = Instant::now();
         let ended =
@@ -1293,6 +1322,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    #[tokio::test]
+    async fn a_saved_plaintext_remote_url_never_starts_token_handshake() {
+        let settings = SettingsStore::in_memory(Settings {
+            server_url: Some("http://192.0.2.1".into()),
+            station_token: Some("must-not-leak".into()),
+            ..Default::default()
+        });
+        let handle = spawn_with(
+            settings.clone(),
+            temp_dir("insecure-endpoint").join("print-jobs.jsonl"),
+            beat_with(Duration::from_secs(1), || Ok(vec![])),
+        );
+        assert!(
+            wait_for(Duration::from_secs(1), || handle
+                .status()
+                .detail()
+                .contains("HTTPS"))
+            .await,
+            "insecure saved URL did not fail before dial: {:?}",
+            handle.status()
+        );
+        let status = handle.status();
+        assert_eq!(status.state, RelayState::EndpointInsecure);
+        assert!(status.state.needs_a_human(), "/health must flag attention");
+        assert!(status.detail().contains("vincular"));
+        assert!(!status.connected);
+        assert!(!status.detail().contains("must-not-leak"));
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("local simulator");
+        let local_url = format!("http://{}", listener.local_addr().expect("address"));
+        let simulator = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("relay dial");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(socket);
+        });
+        settings
+            .update(|s| s.server_url = Some(local_url))
+            .expect("new pairing endpoint");
+        handle.reconnect();
+        assert!(
+            wait_for(Duration::from_secs(1), || {
+                let status = handle.status();
+                status.state == RelayState::Connecting && status.last_error.is_none()
+            })
+            .await,
+            "stale security error after a safe re-pair: {:?}",
+            handle.status()
+        );
+        simulator.abort();
     }
 
     /// A `PrinterBeat` wired to a spooler the test drives, on a short clock.
@@ -2406,6 +2488,7 @@ mod tests {
         for (state, connected, rejected, blocked) in [
             (RelayState::Connected, true, false, false),
             (RelayState::Rejected, false, true, false),
+            (RelayState::EndpointInsecure, false, false, false),
             (RelayState::Standby, false, false, true),
             (RelayState::LedgerUnavailable, false, false, false),
             (RelayState::Connecting, false, false, false),

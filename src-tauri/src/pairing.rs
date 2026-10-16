@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::SettingsStore;
+use crate::config::{validated_server_url, SettingsStore};
 use crate::error::{BridgeError, BridgeResult};
 
 /// Generous enough for a till on a bad ADSL line, short enough that the UI does
@@ -138,16 +138,13 @@ pub async fn pair(
         ));
     }
 
-    let base = server_url.trim().trim_end_matches('/');
-    if base.is_empty() {
-        return Err(BridgeError::Pairing(
-            "Falta la dirección del servidor de GourmelyHub.".into(),
-        ));
-    }
+    let base = validated_server_url(server_url).map_err(BridgeError::Pairing)?;
     let url = format!("{base}/v1/print-relay/pair");
 
     let client = reqwest::Client::builder()
         .timeout(PAIR_TIMEOUT)
+        // A 30x can turn a one-use pairing code into a request to an attacker.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("GourmelyPrintBridge/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| BridgeError::Pairing(format!("no se pudo preparar la conexión: {e}")))?;
@@ -167,6 +164,11 @@ pub async fn pair(
         })?;
 
     let status = response.status();
+    if status.is_redirection() {
+        return Err(BridgeError::Pairing(
+            "El servidor redirigió la vinculación; comprueba la dirección configurada.".into(),
+        ));
+    }
     let body = response
         .text()
         .await
@@ -231,6 +233,7 @@ pub fn forget(settings: &SettingsStore) -> BridgeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn normalises_what_a_human_types() {
@@ -258,5 +261,68 @@ mod tests {
             .expect_err("should refuse");
         assert!(matches!(err, BridgeError::Pairing(_)));
         assert!(err.to_string().contains("8 caracteres"));
+    }
+
+    #[tokio::test]
+    async fn a_remote_plaintext_endpoint_cannot_redeem_a_code() {
+        let settings = SettingsStore::in_memory(Default::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            pair(&settings, "http://192.0.2.1", "FJTX-35AH", vec![]),
+        )
+        .await
+        .expect("insecure URL must fail before network access");
+        assert!(result
+            .expect_err("must reject HTTP")
+            .to_string()
+            .contains("HTTPS"));
+        assert!(!settings.snapshot().is_paired());
+    }
+
+    #[tokio::test]
+    async fn pairing_does_not_follow_a_redirect_with_the_one_use_code() {
+        let destination = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("destination");
+        let destination_url = format!("http://{}", destination.local_addr().expect("address"));
+        let destination_task = tokio::spawn(async move {
+            let (mut stream, _) = destination.accept().await.expect("redirect arrived");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("request");
+            let body = r#"{"success":true,"data":{"stationToken":"leaked","stationId":"s","tenantId":"t","branchId":"b","label":"Caja","roles":[]}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("response");
+        });
+
+        let source = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("source");
+        let source_url = format!("http://{}", source.local_addr().expect("address"));
+        let source_task = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.expect("pair request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("request");
+            stream
+                .write_all(format!("HTTP/1.1 302 Found\r\nLocation: {destination_url}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+                .await
+                .expect("redirect");
+        });
+        let settings = SettingsStore::in_memory(Default::default());
+        let result = pair(&settings, &source_url, "FJTX-35AH", vec![]).await;
+        assert!(result.is_err(), "redirect must not redeem a one-use code");
+        assert!(!settings.snapshot().is_paired());
+        source_task.await.expect("source task");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), destination_task)
+                .await
+                .is_err(),
+            "redirect destination was contacted"
+        );
     }
 }

@@ -53,7 +53,11 @@ the socket open, so there is no port to forward and no static IP to buy.
   `%PROGRAMDATA%\GourmelyPrint\config.json`. No file editing, ever.
 - **Transport.** Socket.IO v5 over Engine.IO v4, namespace `/print`, spoken by
   hand in `src/engineio.rs` — see the module header for why an off-the-shelf
-  client did not survive contact with the real server.
+  client did not survive contact with the real server. Remote API endpoints
+  require HTTPS; HTTP is permitted only for explicit loopback development
+  endpoints. Pairing never follows redirects. A station paired to an older
+  remote HTTP URL stops before sending its token and shows a security warning
+  in the settings, tray, and `/health`; re-pair it with the HTTPS URL.
 - **Reconnection.** Infinite, exponential, capped at 60 s. A revoked token is
   told apart from a dead link: it backs off to 5 minutes and the UI says "vuelve
   a vincular" instead of "sin conexión".

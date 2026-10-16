@@ -24,6 +24,7 @@ type RelayStateName =
   | 'connecting'
   | 'connected'
   | 'rejected'
+  | 'endpoint-insecure'
   | 'standby'
   | 'ledger-unavailable';
 
@@ -40,6 +41,7 @@ const RELAY_STATE_LABEL: Record<RelayStateName, string> = {
   connecting: 'Reconectando…',
   connected: 'Conectado',
   rejected: 'Rechazada',
+  'endpoint-insecure': 'Servidor inseguro',
   standby: 'En espera',
   'ledger-unavailable': 'No puede imprimir',
 };
@@ -199,7 +201,10 @@ function renderRelay(status: RelayStatus) {
     // `ledgerRecovered` outranks the rest when there is nothing wrong right
     // now: the bridge is working, and the one thing worth saying is that a
     // ticket from just before may come out twice.
-    const stuck = status.state === 'standby' || status.state === 'ledger-unavailable';
+    const stuck =
+      status.state === 'standby' ||
+      status.state === 'ledger-unavailable' ||
+      status.state === 'endpoint-insecure';
     if (status.lastError && (status.paired || stuck)) {
       error.textContent = status.lastError;
       error.hidden = false;
