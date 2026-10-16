@@ -314,7 +314,13 @@ pub fn run() {
             // and for what happens when the file on disk is corrupt.
             let server_settings = settings;
             tauri::async_runtime::spawn(async move {
-                let tls = tls_material::resolve(CERT_PEM, KEY_PEM);
+                let tls = match tls_material::resolve(CERT_PEM, KEY_PEM) {
+                    Ok(tls) => tls,
+                    Err(error) => {
+                        tracing::error!(%error, "local TLS unavailable; install a valid certificate and restart the bridge");
+                        return;
+                    }
+                };
                 tracing::info!(source = tls.source, "TLS material resolved");
                 if let Err(e) =
                     server::serve(&tls.cert, &tls.key, server_settings, Some(server_relay)).await
