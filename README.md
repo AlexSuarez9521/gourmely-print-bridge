@@ -179,8 +179,8 @@ The committed TLS private key is safe by design — see
 On Windows, the bridge protects `%PROGRAMDATA%\GourmelyPrint` and existing
 config/print-ledger files for the active console or RDP user, SYSTEM, and
 Administrators. An OWNER RIGHTS entry prevents a legacy owner from restoring
-access by rewriting the ACL. If a legacy ACL cannot be repaired, a readable config remains
-available but settings writes stop; `/health.configuration_security` and the
+access by rewriting the ACL. If a legacy ACL cannot be repaired, a readable
+config remains available but settings writes stop; `/health.configuration_security` and the
 status panel explain the repair. With the cashier session active, close the
 bridge, run the installed bridge once as Administrator, close that elevated
 instance, and start it normally. Check that `/health.configuration_security`

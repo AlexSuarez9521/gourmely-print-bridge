@@ -73,7 +73,7 @@ fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
     // OWNER RIGHTS removes the implicit WRITE_DAC held by a legacy owner.
     // Without it, an old account could silently grant itself access again.
     assert!(
-        dacl.contains("(A;;RC;;;OW)") || dacl.contains("(A;OICI;RC;;;OW)"),
+        dacl.contains(";RC;;;OW)"),
         "legacy owner can still rewrite the DACL: {sddl}"
     );
     // Windows serializes the local Administrator RID-500 SID as the SDDL
@@ -177,4 +177,39 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
         fs::read(damaged_config).expect("read damaged config"),
         invalid
     );
+
+    // An unsafe legacy path must remain readable, but cannot receive a new
+    // token or ledger write merely because the JSON itself still parses.
+    let target = std::env::temp_dir().join(format!("gourmely-acl-target-{}", uuid::Uuid::new_v4()));
+    let junction = std::env::temp_dir().join(format!("gourmely-acl-link-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&target).expect("create junction target");
+    let _target_sandbox = Sandbox(target.clone());
+    let preserved = br#"{"stationToken":"legacy-token","localSecret":"legacy-secret"}"#;
+    fs::write(target.join("config.json"), preserved).expect("write junction target config");
+    let link = Command::new("cmd.exe")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target)
+        .output()
+        .expect("create junction fixture");
+    assert!(
+        link.status.success(),
+        "mklink failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    std::env::set_var("GOURMELYPRINT_DATA_DIR", &junction);
+    let unsafe_path = SettingsStore::load();
+    assert_eq!(
+        unsafe_path.snapshot().station_token.as_deref(),
+        Some("legacy-token")
+    );
+    assert!(unsafe_path
+        .security_issue()
+        .unwrap_or_default()
+        .contains("administrador"));
+    assert!(unsafe_path
+        .update(|s| s.label = Some("Unsafe".into()))
+        .is_err());
+    assert_eq!(fs::read(target.join("config.json")).unwrap(), preserved);
+    fs::remove_dir(&junction).expect("remove junction without touching target");
 }
