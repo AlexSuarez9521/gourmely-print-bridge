@@ -124,7 +124,11 @@ pub fn interactive_user_sid() -> io::Result<String> {
     let lookup = (|| -> io::Result<Vec<String>> {
         let mut identities = Vec::new();
         // SAFETY: the array has exactly `count` elements until WTSFreeMemory.
-        let active = unsafe { std::slice::from_raw_parts(sessions, count as usize) };
+        let active = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(sessions, count as usize) }
+        };
         for session in active.iter().filter(|session| session.State == WTSActive) {
             let name = session_field(session.SessionId, WTSUserName)?;
             if name.is_empty() {
@@ -141,7 +145,9 @@ pub fn interactive_user_sid() -> io::Result<String> {
         Ok(identities)
     })();
     // SAFETY: this pointer came from WTSEnumerateSessionsW.
-    unsafe { WTSFreeMemory(sessions.cast()) };
+    if !sessions.is_null() {
+        unsafe { WTSFreeMemory(sessions.cast()) };
+    }
     let mut identities = lookup?;
     identities.sort();
     identities.dedup();
@@ -214,11 +220,14 @@ fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<
     result
 }
 
-const SENSITIVE_FILES: [&str; 4] = [
+const SENSITIVE_FILES: [&str; 7] = [
     "config.json",
     "config.json.tmp",
     "local-print-intents.jsonl",
     "local-print-intents.lock",
+    "print-jobs.jsonl",
+    "print-jobs.jsonl.tmp",
+    "print-jobs.lock",
 ];
 
 fn exists_or_error(path: &Path) -> io::Result<bool> {
@@ -235,7 +244,8 @@ fn exists_or_error(path: &Path) -> io::Result<bool> {
 
 /// Preflight *all* legacy files before modifying any ACL or allowing writes.
 pub fn protect_data_dir_for_user(dir: &Path, user_sid: &str) -> io::Result<()> {
-    if exists_or_error(dir)? {
+    let existed = exists_or_error(dir)?;
+    if existed {
         std::fs::read_dir(dir)?;
     }
     for name in SENSITIVE_FILES {
@@ -245,6 +255,9 @@ pub fn protect_data_dir_for_user(dir: &Path, user_sid: &str) -> io::Result<()> {
         }
     }
     std::fs::create_dir_all(dir)?;
+    if !existed {
+        set_private_dacl(dir, user_sid, true)?;
+    }
     // Files first: an existing readable config remains accessible even if
     // hardening the installer-owned parent fails without WRITE_DAC.
     for name in SENSITIVE_FILES {
@@ -253,7 +266,10 @@ pub fn protect_data_dir_for_user(dir: &Path, user_sid: &str) -> io::Result<()> {
             set_private_dacl(&path, user_sid, false)?;
         }
     }
-    set_private_dacl(dir, user_sid, true)
+    if existed {
+        set_private_dacl(dir, user_sid, true)?;
+    }
+    Ok(())
 }
 
 pub fn protect_file_for_user(path: &Path, user_sid: &str) -> io::Result<()> {

@@ -355,7 +355,7 @@ impl SettingsStore {
         let acl_error = acl.as_ref().err().map(|e| e.to_string());
         let acl_user_sid = acl.ok();
         let security_issue = if unreadable || acl_error.is_some() {
-            Some("Configuration security needs repair: run the repair as administrator, then restart the bridge.".to_string())
+            Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string())
         } else {
             None
         };
@@ -393,7 +393,7 @@ impl SettingsStore {
                             // and the POS keeps printing through the origin check.
                             // It just has to be re-issued on the next boot.
                             tracing::error!(err = %e, "could not persist the generated local secret");
-                            security_issue = Some("Configuration security needs repair: run the repair as administrator, then restart the bridge.".to_string());
+                            security_issue = Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string());
                         }
                     }
                 }

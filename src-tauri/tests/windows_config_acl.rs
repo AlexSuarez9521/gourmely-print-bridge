@@ -95,6 +95,9 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
         ("config.json.tmp", b"stale-secret".as_slice()),
         ("local-print-intents.jsonl", b"ledger-record\n".as_slice()),
         ("local-print-intents.lock", b"".as_slice()),
+        ("print-jobs.jsonl", b"relay-record\n".as_slice()),
+        ("print-jobs.jsonl.tmp", b"relay-temp".as_slice()),
+        ("print-jobs.lock", b"".as_slice()),
     ];
     for (name, bytes) in sensitive {
         let path = dir.join(name);
@@ -141,7 +144,7 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     std::env::set_var("GOURMELYPRINT_DATA_DIR", &damaged);
     let fallback = SettingsStore::load();
     assert!(
-        fallback.security_issue().unwrap_or_default().contains("administrator"),
+        fallback.security_issue().unwrap_or_default().contains("administrador"),
         "the operator needs an explicit elevated repair action"
     );
     assert!(fallback.update(|s| s.label = Some("Unsafe".into())).is_err());
