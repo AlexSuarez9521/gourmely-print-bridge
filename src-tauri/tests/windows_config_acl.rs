@@ -70,7 +70,7 @@ fn assert_private_acl(path: &Path, user_sid: &str, protected: bool) {
         .filter_map(|ace| ace.rsplit(";;;").next())
         .collect();
     assert!(!trustees.is_empty(), "empty DACL: {sddl}");
-    for trustee in trustees {
+    for &trustee in &trustees {
         assert!(
             trustee == user_sid || matches!(trustee, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544"),
             "unexpected ACL trustee {trustee}: {sddl}"
