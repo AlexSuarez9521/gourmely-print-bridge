@@ -29,6 +29,8 @@ pub mod relay;
 pub mod server;
 pub mod tls_material;
 pub mod tray;
+#[cfg(windows)]
+pub mod windows_acl;
 
 use tauri::{Manager, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
