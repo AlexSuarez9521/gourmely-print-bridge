@@ -110,6 +110,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// brings, shallow enough that a wedged spooler is noticed instead of
 /// swallowing the evening's tickets.
 const PRINT_QUEUE_DEPTH: usize = 256;
+/// Do not ask the server to replay a burst into a still-full local queue.
+const PRINT_QUEUE_LOW_WATER: usize = PRINT_QUEUE_DEPTH / 4;
 
 const EV_PRINT_JOB: &str = "print-job";
 const EV_PRINT_RESULT: &str = "print-result";
@@ -438,6 +440,8 @@ enum Ended {
     /// The server refused the token. Retry slowly and tell the operator.
     Rejected(String),
     PairingChanged,
+    /// The reader stopped rather than silently dropping a job it could not queue.
+    Saturated,
 }
 
 /// Outgoing text frames, from anywhere in the process to the live socket.
@@ -549,7 +553,7 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
 
     let mut attempt: u32 = 0;
 
-    loop {
+    'supervise: loop {
         let settings = handle.settings.snapshot();
         let generation = handle.generation();
         let Some(token) = settings.station_token.clone() else {
@@ -580,6 +584,28 @@ async fn supervise(handle: RelayHandle, ledger_path: PathBuf, printers: PrinterB
             Ended::PairingChanged => {
                 attempt = 0;
                 continue;
+            }
+            Ended::Saturated => {
+                handle.fail(
+                    RelayState::Connecting,
+                    "La cola de impresión está llena. Revisa que la impresora responda; se reconectará para recuperar trabajos pendientes.".into(),
+                );
+                // The server retains the unaccepted job. Reconnecting before
+                // the worker has made room only repeats the same overflow.
+                let mut pairing = handle.pairing.subscribe();
+                while tx.capacity() < PRINT_QUEUE_DEPTH - PRINT_QUEUE_LOW_WATER {
+                    if *pairing.borrow() != generation {
+                        attempt = 0;
+                        continue 'supervise;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = pairing.changed() => {}
+                    }
+                }
+                let delay = backoff(attempt);
+                attempt = attempt.saturating_add(1);
+                delay
             }
             Ended::Rejected(msg) => {
                 tracing::error!(err = %msg, "relay rejected: the station token is not valid");
@@ -908,7 +934,7 @@ async fn run_connection(
     // noticed — a mobile connection dropping is exactly that shape.
     let silence_limit = Duration::from_millis(open.ping_interval + open.ping_timeout);
 
-    let ended = loop {
+    let ended = 'read: loop {
         let frame = tokio::select! {
             changed = pairing.changed() => {
                 let _ = changed;
@@ -935,17 +961,23 @@ async fn run_connection(
                                 // `try_send`, not `send`: blocking the reader on
                                 // a full queue also blocks the heartbeat, and a
                                 // slow printer would look like a dead link.
-                                if let Err(e) = jobs.try_send(QueuedJob {
+                                match jobs.try_send(QueuedJob {
                                     job,
                                     generation,
                                     default_printer: handle.settings.snapshot().default_printer,
                                 }) {
-                                    tracing::error!(err = %e, "print queue full; the server will replay the job");
-                                    handle.mutate(|s| {
-                                        s.last_error = Some(
-                                            "La cola de impresión está llena. Revisa que la impresora responda.".into(),
-                                        )
-                                    });
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::error!(
+                                            "print queue full; closing socket for server replay"
+                                        );
+                                        break 'read Ended::Saturated;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        break 'read Ended::Transport(
+                                            "el trabajador de impresión se cerró".into(),
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => tracing::error!(err = %e, "print-job payload did not parse"),
@@ -1242,6 +1274,8 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use std::net::SocketAddr;
+
+    static SINK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gmly-relay-{name}"));
@@ -1722,6 +1756,7 @@ mod tests {
 
     #[test]
     fn unpair_fences_a_job_waiting_for_a_blocking_spooler_thread() {
+        let _sink_lock = SINK_TEST_LOCK.lock().expect("sink test lock");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -1826,6 +1861,315 @@ mod tests {
         );
         assert!(wait_for(Duration::from_secs(2), || spy.hellos().len() >= 3).await);
         assert_eq!(handle.status().state, RelayState::Connected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_print_queue_closes_the_socket_for_server_replay() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind fake relay");
+        let url = format!("ws://{}", listener.local_addr().expect("relay addr"));
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept bridge");
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("WebSocket handshake");
+            let (mut sink, mut source) = ws.split();
+            sink.send(Message::text(
+                r#"0{"sid":"queue-test","upgrades":[],"pingInterval":300000,"pingTimeout":200000,"maxPayload":1000000}"#,
+            ))
+            .await
+            .expect("Engine.IO open");
+            while let Some(Ok(message)) = source.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                if text.starts_with("40/print,") {
+                    sink.send(Message::text(r#"40/print,{"sid":"queue-print"}"#))
+                        .await
+                        .expect("namespace ack");
+                    for id in 0..3 {
+                        sink.send(Message::text(engineio::event_packet(
+                            NAMESPACE,
+                            EV_PRINT_JOB,
+                            &json!({
+                                "jobId": format!("saturated-{id}"),
+                                "escposBase64": BASE64.encode(b"ticket"),
+                                "osPrinterName": "FakePrinter",
+                            }),
+                        )))
+                        .await
+                        .expect("send job");
+                    }
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+
+        let handle = RelayHandle {
+            settings: SettingsStore::in_memory(Settings::default()),
+            status: Arc::new(RwLock::new(RelayStatus::default())),
+            wake: Arc::new(Notify::new()),
+            pairing: watch::channel(0).0,
+        };
+        // Holding the receiver models a spooler that cannot consume work.
+        let (jobs, _blocked_spooler) = mpsc::channel(1);
+        let outbound = Arc::new(StdMutex::new(None));
+        let printers = beat_with(Duration::from_secs(1), || Ok(vec!["FakePrinter".into()]));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_connection(&handle, &url, "station-a", 0, &jobs, &outbound, &printers),
+        )
+        .await
+        .expect("queue saturation did not close the socket");
+        assert!(format!("{result:?}").contains("Saturated"), "{result:?}");
+        tokio::time::timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("server did not observe socket close")
+            .expect("close signal");
+    }
+
+    #[test]
+    fn saturated_relay_waits_for_drain_and_replays_without_duplicate_prints() {
+        let _sink_lock = SINK_TEST_LOCK.lock().expect("sink test lock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sink_dir = temp_dir("saturation-replay-sink");
+        std::env::set_var("GOURMELYPRINT_SINK_DIR", &sink_dir);
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("signal pool occupied");
+                release_rx.recv().expect("release pool");
+            });
+            started_rx.await.expect("pool occupied");
+
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("fake relay");
+            let server_url = format!("http://{}", listener.local_addr().expect("server addr"));
+            let connections = Arc::new(AtomicU64::new(0));
+            let closed = Arc::new(AtomicU64::new(0));
+            let acknowledged = Arc::new(StdMutex::new(std::collections::HashSet::<String>::new()));
+            let server_connections = connections.clone();
+            let server_closed = closed.clone();
+            let server_acks = acknowledged.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    server_connections.fetch_add(1, Ordering::SeqCst);
+                    let closed = server_closed.clone();
+                    let acks = server_acks.clone();
+                    tokio::spawn(async move {
+                        let ws = tokio_tungstenite::accept_async(stream)
+                            .await
+                            .expect("WebSocket handshake");
+                        let (mut sink, mut source) = ws.split();
+                        sink.send(Message::text(
+                            r#"0{"sid":"replay","upgrades":[],"pingInterval":300000,"pingTimeout":200000,"maxPayload":1000000}"#,
+                        ))
+                        .await
+                        .expect("Engine.IO open");
+                        'frames: while let Some(Ok(message)) = source.next().await {
+                            let Message::Text(text) = message else { continue };
+                            if text.starts_with("40/print,") {
+                                sink.send(Message::text(r#"40/print,{"sid":"replay-print"}"#))
+                                    .await
+                                    .expect("namespace ack");
+                                let already = acks.lock().expect("acks").clone();
+                                for id in 0..PRINT_QUEUE_DEPTH + 2 {
+                                    let job_id = format!("replay-{id}");
+                                    if already.contains(&job_id) {
+                                        continue;
+                                    }
+                                    if sink.send(Message::text(engineio::event_packet(
+                                        NAMESPACE,
+                                        EV_PRINT_JOB,
+                                        &json!({
+                                            "jobId": job_id,
+                                            "escposBase64": BASE64.encode(b"ticket"),
+                                            "osPrinterName": "FakePrinter",
+                                        }),
+                                    )))
+                                    .await
+                                    .is_err() {
+                                        break 'frames;
+                                    }
+                                }
+                            } else if let Incoming::Event { namespace, name, args } =
+                                engineio::parse(&text)
+                            {
+                                if namespace == NAMESPACE && name == EV_PRINT_RESULT {
+                                    for arg in args {
+                                        if arg["ok"] == true {
+                                            if let Some(id) = arg["jobId"].as_str() {
+                                                acks.lock().expect("acks").insert(id.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+
+            let settings = SettingsStore::in_memory(Settings {
+                server_url: Some(server_url),
+                station_token: Some("station-a".into()),
+                ..Default::default()
+            });
+            let handle = spawn_with(
+                settings,
+                temp_dir("saturation-replay-ledger").join("jobs.jsonl"),
+                beat_with(Duration::from_millis(100), || Ok(vec!["FakePrinter".into()])),
+            );
+            assert!(wait_for(Duration::from_secs(5), || closed.load(Ordering::SeqCst) > 0).await,
+                "saturated socket never closed: {:?}", handle.status());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let reconnected_before_drain = connections.load(Ordering::SeqCst) > 1;
+
+            release_tx.send(()).expect("release pool");
+            blocker.await.expect("blocker complete");
+            assert!(!reconnected_before_drain, "relay reconnected into an undrained queue");
+            assert!(wait_for(Duration::from_secs(30), || connections.load(Ordering::SeqCst) >= 2).await,
+                "relay did not reconnect after queue drained");
+            assert!(wait_for(Duration::from_secs(30), || acknowledged.lock().expect("acks").len()
+                == PRINT_QUEUE_DEPTH + 2).await, "not every replayed job was acknowledged");
+            assert_eq!(std::fs::read_dir(&sink_dir).expect("sink").count(), PRINT_QUEUE_DEPTH + 2,
+                "replay printed a job twice or lost a job");
+            for entry in std::fs::read_dir(&sink_dir).expect("sink") {
+                assert_eq!(std::fs::read(entry.expect("sink entry").path()).expect("ticket"), b"ticket");
+            }
+        });
+        std::env::remove_var("GOURMELYPRINT_SINK_DIR");
+    }
+
+    #[test]
+    fn unpair_interrupts_saturated_queue_drain_wait() {
+        let _sink_lock = SINK_TEST_LOCK.lock().expect("sink test lock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let sink_dir = temp_dir("verify-unpair-sink");
+        std::env::set_var("GOURMELYPRINT_SINK_DIR", &sink_dir);
+        runtime.block_on(async {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("signal pool occupied");
+                release_rx.recv().expect("release pool");
+            });
+            started_rx.await.expect("pool occupied");
+
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("fake relay");
+            let server_url = format!("http://{}", listener.local_addr().expect("server addr"));
+            let connections = Arc::new(AtomicU64::new(0));
+            let closed = Arc::new(AtomicU64::new(0));
+            let acknowledged = Arc::new(StdMutex::new(std::collections::HashSet::<String>::new()));
+            let server_connections = connections.clone();
+            let server_closed = closed.clone();
+            let server_acks = acknowledged.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    server_connections.fetch_add(1, Ordering::SeqCst);
+                    let closed = server_closed.clone();
+                    let acks = server_acks.clone();
+                    tokio::spawn(async move {
+                        let ws = tokio_tungstenite::accept_async(stream)
+                            .await
+                            .expect("WebSocket handshake");
+                        let (mut sink, mut source) = ws.split();
+                        sink.send(Message::text(
+                            r#"0{"sid":"replay","upgrades":[],"pingInterval":300000,"pingTimeout":200000,"maxPayload":1000000}"#,
+                        ))
+                        .await
+                        .expect("Engine.IO open");
+                        'frames: while let Some(Ok(message)) = source.next().await {
+                            let Message::Text(text) = message else { continue };
+                            if text.starts_with("40/print,") {
+                                sink.send(Message::text(r#"40/print,{"sid":"replay-print"}"#))
+                                    .await
+                                    .expect("namespace ack");
+                                let already = acks.lock().expect("acks").clone();
+                                for id in 0..PRINT_QUEUE_DEPTH + 2 {
+                                    let job_id = format!("replay-{id}");
+                                    if already.contains(&job_id) {
+                                        continue;
+                                    }
+                                    if sink.send(Message::text(engineio::event_packet(
+                                        NAMESPACE,
+                                        EV_PRINT_JOB,
+                                        &json!({
+                                            "jobId": job_id,
+                                            "escposBase64": BASE64.encode(b"ticket"),
+                                            "osPrinterName": "FakePrinter",
+                                        }),
+                                    )))
+                                    .await
+                                    .is_err() {
+                                        break 'frames;
+                                    }
+                                }
+                            } else if let Incoming::Event { namespace, name, args } =
+                                engineio::parse(&text)
+                            {
+                                if namespace == NAMESPACE && name == EV_PRINT_RESULT {
+                                    for arg in args {
+                                        if arg["ok"] == true {
+                                            if let Some(id) = arg["jobId"].as_str() {
+                                                acks.lock().expect("acks").insert(id.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+
+            let settings = SettingsStore::in_memory(Settings {
+                server_url: Some(server_url),
+                station_token: Some("station-a".into()),
+                ..Default::default()
+            });
+            let handle = spawn_with(
+                settings.clone(),
+                temp_dir("verify-unpair-ledger").join("jobs.jsonl"),
+                beat_with(Duration::from_millis(100), || Ok(vec!["FakePrinter".into()])),
+            );
+            assert!(wait_for(Duration::from_secs(5), || closed.load(Ordering::SeqCst) > 0).await,
+                "saturated socket never closed: {:?}", handle.status());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let reconnected_before_drain = connections.load(Ordering::SeqCst) > 1;
+
+            settings.update(|s| s.station_token = None).expect("unpair");
+            handle.reconnect();
+            let unpaired = wait_for(Duration::from_secs(2), || handle.status().state == RelayState::Unpaired).await;
+            let before = std::fs::read_dir(&sink_dir).expect("sink").count();
+            release_tx.send(()).expect("release pool");
+            blocker.await.expect("blocker complete");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!reconnected_before_drain, "reconnect before draining");
+            assert!(unpaired, "unpair was blocked by saturated queue");
+            assert_eq!(connections.load(Ordering::SeqCst), 1, "old station reconnected");
+            assert_eq!(before, 0);
+            assert_eq!(std::fs::read_dir(&sink_dir).expect("sink").count(), 0, "stale queue printed after unpair");
+        });
+        std::env::remove_var("GOURMELYPRINT_SINK_DIR");
     }
 
     /// The whole of P3, through the real wiring: connect, beat, lose the
