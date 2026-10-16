@@ -210,6 +210,8 @@ struct HealthResponse {
     uptime_seconds: u64,
     printer_count: usize,
     relay: HealthRelay,
+    /// A failed Windows credential migration never silently looks healthy.
+    configuration_security: Option<String>,
 }
 
 /// The relay, as `/health` reports it.
@@ -392,6 +394,7 @@ async fn health_handler(State(s): State<ServerState>) -> Json<HealthResponse> {
         uptime_seconds: s.started_at.elapsed().as_secs(),
         printer_count,
         relay: HealthRelay::of(s.relay.as_ref()),
+        configuration_security: s.settings.security_issue().map(str::to_owned),
     })
 }
 
@@ -724,6 +727,30 @@ mod tests {
     };
 
     type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    #[tokio::test]
+    async fn health_explains_acl_repair_without_exposing_credentials() {
+        let state = ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                station_token: Some("private-token".into()),
+                ..Default::default()
+            })
+            .with_security_issue("Run the bridge once as administrator, then restart normally."),
+            relay: None,
+            local_ledger: None,
+            print_raw: Arc::new(printer::print_raw),
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+        let body = serde_json::to_value(health_handler(State(state)).await.0).unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(body["configuration_security"]
+            .as_str()
+            .unwrap()
+            .contains("administrator"));
+        assert!(!body.to_string().contains("private-token"));
+    }
 
     #[test]
     fn health_explains_a_saved_plaintext_endpoint_requires_repairing() {
