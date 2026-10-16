@@ -249,6 +249,9 @@ const ACL_REPAIR_ACTION: &str = "La configuración necesita reparación: abre Go
 #[cfg(windows)]
 const MALFORMED_CONFIG_ACTION: &str = "config.json está dañado: detén GourmelyPrint Bridge, haz un respaldo seguro del archivo y restaura una copia válida o renómbralo; luego reinicia y vuelve a emparejar la estación.";
 
+#[cfg(windows)]
+const OTHER_USER_ACTION: &str = "Los archivos protegidos pertenecen a otro usuario de Windows. No se cambiaron los permisos: cierra Bridge, inicia la sesión de caja correcta y ejecuta la reparación como administrador con esa sesión activa.";
+
 /// Reads the settings file, tolerating every way it can be absent or broken.
 ///
 /// A corrupt file must never stop the bridge from booting: the till would lose
@@ -364,14 +367,25 @@ impl SettingsStore {
     #[cfg(windows)]
     fn load_with_acl(acl: std::io::Result<String>) -> Self {
         let (settings, read_issue) = load_from_disk();
+        let other_user = acl
+            .as_ref()
+            .err()
+            .and_then(|error| error.get_ref())
+            .is_some_and(|error| error.is::<crate::windows_acl::ProtectedUserMismatch>());
         let acl_error = acl.as_ref().err().map(|e| e.to_string());
         let acl_user_sid = acl.ok();
-        let security_issue = match (acl_error.is_some(), read_issue) {
-            (true, _) | (_, Some(ConfigReadIssue::Unreadable)) => {
-                Some(ACL_REPAIR_ACTION.to_string())
+        let security_issue = if other_user {
+            Some(OTHER_USER_ACTION.to_string())
+        } else {
+            match (acl_error.is_some(), read_issue) {
+                (true, _) | (_, Some(ConfigReadIssue::Unreadable)) => {
+                    Some(ACL_REPAIR_ACTION.to_string())
+                }
+                (false, Some(ConfigReadIssue::Malformed)) => {
+                    Some(MALFORMED_CONFIG_ACTION.to_string())
+                }
+                (false, None) => None,
             }
-            (false, Some(ConfigReadIssue::Malformed)) => Some(MALFORMED_CONFIG_ACTION.to_string()),
-            (false, None) => None,
         };
         if let Some(error) = acl_error {
             tracing::error!(%error, "Windows credential ACL migration failed; preserving existing files read-only");

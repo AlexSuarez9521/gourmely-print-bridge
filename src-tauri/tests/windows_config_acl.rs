@@ -154,6 +154,38 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     fs::write(&temp_probe, b"").expect("create replacement temp file");
     assert_private_acl(&temp_probe, &user_sid, false);
 
+    let saved_config = fs::read(&config).expect("read saved config");
+    let parent_acl = powershell(
+        "[System.IO.Directory]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)",
+        &dir,
+    );
+    let config_acl = powershell(
+        "[System.IO.File]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)",
+        &config,
+    );
+    std::env::set_var(
+        "GOURMELYPRINT_ACL_TEST_SID",
+        "S-1-5-21-11111111-22222222-33333333-4444",
+    );
+    let wrong_user = SettingsStore::load();
+    assert!(wrong_user
+        .security_issue()
+        .unwrap_or_default()
+        .contains("otro usuario de Windows"));
+    assert!(wrong_user
+        .update(|settings| settings.label = Some("Wrong user".into()))
+        .is_err());
+    assert_eq!(fs::read(&config).unwrap(), saved_config);
+    assert_eq!(
+        powershell("[System.IO.Directory]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)", &dir),
+        parent_acl
+    );
+    assert_eq!(
+        powershell("[System.IO.File]::GetAccessControl($env:GOURMELYPRINT_ACL_TEST_PATH).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)", &config),
+        config_acl
+    );
+    std::env::set_var("GOURMELYPRINT_ACL_TEST_SID", &user_sid);
+
     let damaged =
         std::env::temp_dir().join(format!("gourmely-acl-damaged-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&damaged).expect("create damaged fixture directory");

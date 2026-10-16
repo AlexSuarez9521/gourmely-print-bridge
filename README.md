@@ -179,11 +179,19 @@ The committed TLS private key is safe by design — see
 On Windows, the bridge protects `%PROGRAMDATA%\GourmelyPrint` and existing
 config/print-ledger files for the active console or RDP user, SYSTEM, and
 Administrators. An OWNER RIGHTS entry prevents a legacy owner from restoring
-access by rewriting the ACL. If a legacy ACL cannot be repaired, a readable
-config remains available but settings writes stop; `/health.configuration_security` and the
-status panel explain the repair. With the cashier session active, close the
-bridge, run the installed bridge once as Administrator, close that elevated
-instance, and start it normally. Check that `/health.configuration_security`
+access by rewriting the ACL. An already protected directory or file cannot
+be reassigned to another active Windows user. If ACL repair fails, readable
+config remains available but settings writes stop; `/health.configuration_security`
+and the status panel explain the repair.
+
+For installation or repair, stop the bridge, install binaries as Administrator
+**without launching the bridge**, then start it only from the cashier's
+interactive session. Never launch it from an SSH or administrator session.
+For a legacy ACL that still needs elevation, keep the cashier's session active,
+run the bridge once elevated from that session, close the elevated instance,
+and start it normally as the cashier. If the status says files belong to
+another Windows user, do not reassign the ACL manually; close other sessions
+and use the correct cashier session. Confirm `/health.configuration_security`
 is `null` before pairing or changing settings; do not edit tokens by hand.
 
 If the status instead reports damaged `config.json`, elevation alone cannot
