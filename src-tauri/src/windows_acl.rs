@@ -172,7 +172,11 @@ fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<
         ));
     }
     let flags = if directory { "OICI" } else { "" };
-    let sddl = format!("D:P(A;{flags};FA;;;{user_sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)");
+    // OWNER RIGHTS suppresses an old owner's implicit WRITE_DAC. Grant only
+    // READ_CONTROL there; the cashier, SYSTEM, and Administrators retain FA.
+    let sddl = format!(
+        "D:P(A;{flags};FA;;;{user_sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};RC;;;OW)"
+    );
     let descriptor_text = wide(std::ffi::OsStr::new(&sddl));
     let mut descriptor = std::ptr::null_mut();
     // SAFETY: Windows parses the NUL-terminated SDDL into an owned descriptor.
