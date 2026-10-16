@@ -2,7 +2,6 @@
 //! A failed legacy migration never changes the existing config or ledger bytes.
 
 use std::{
-    ffi::c_void,
     io,
     os::windows::{ffi::OsStrExt, fs::MetadataExt},
     path::Path,
@@ -211,7 +210,7 @@ fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<
         }
     };
     // SAFETY: this pointer came from ConvertStringSecurityDescriptorToSecurityDescriptorW.
-    unsafe { LocalFree(descriptor as *mut c_void) };
+    unsafe { LocalFree(descriptor) };
     result
 }
 

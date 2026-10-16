@@ -91,6 +91,16 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     let config = dir.join("config.json");
     let original = br#"{"stationToken":"legacy-token","localSecret":"legacy-secret"}"#;
     fs::write(&config, original).expect("write legacy config fixture");
+    let sensitive = [
+        ("config.json.tmp", b"stale-secret".as_slice()),
+        ("local-print-intents.jsonl", b"ledger-record\n".as_slice()),
+        ("local-print-intents.lock", b"".as_slice()),
+    ];
+    for (name, bytes) in sensitive {
+        let path = dir.join(name);
+        fs::write(&path, bytes).expect("write sensitive fixture");
+        grant_legacy_users_read(&path, false);
+    }
     grant_legacy_users_read(&dir, true);
     grant_legacy_users_read(&config, false);
     std::env::set_var("GOURMELYPRINT_DATA_DIR", &dir);
@@ -108,6 +118,11 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     assert_eq!(fs::read(&config).expect("read migrated config"), original);
     assert_private_acl(&dir, &user_sid, true);
     assert_private_acl(&config, &user_sid, true);
+    for (name, bytes) in sensitive {
+        let path = dir.join(name);
+        assert_eq!(fs::read(&path).expect("read existing sensitive file"), bytes);
+        assert_private_acl(&path, &user_sid, true);
+    }
 
     store
         .update(|settings| settings.label = Some("Kitchen".into()))
@@ -116,4 +131,19 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
     let temp_probe = dir.join("config.json.tmp");
     fs::write(&temp_probe, b"").expect("create replacement temp file");
     assert_private_acl(&temp_probe, &user_sid, false);
+
+    let damaged = std::env::temp_dir().join(format!("gourmely-acl-damaged-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&damaged).expect("create damaged fixture directory");
+    let _damaged_sandbox = Sandbox(damaged.clone());
+    let damaged_config = damaged.join("config.json");
+    let invalid = b"{not valid JSON but may contain credentials";
+    fs::write(&damaged_config, invalid).expect("write damaged config");
+    std::env::set_var("GOURMELYPRINT_DATA_DIR", &damaged);
+    let fallback = SettingsStore::load();
+    assert!(
+        fallback.security_issue().unwrap_or_default().contains("administrator"),
+        "the operator needs an explicit elevated repair action"
+    );
+    assert!(fallback.update(|s| s.label = Some("Unsafe".into())).is_err());
+    assert_eq!(fs::read(damaged_config).expect("read damaged config"), invalid);
 }
