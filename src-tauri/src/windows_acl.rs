@@ -182,24 +182,6 @@ pub fn interactive_user_sid() -> io::Result<String> {
     unique_active_sid(lookup?)
 }
 
-#[cfg(test)]
-mod selection_tests {
-    use super::unique_active_sid;
-
-    #[test]
-    fn only_one_active_cashier_is_selected_even_if_the_process_is_elevated() {
-        let cashier = "S-1-5-21-1-2-3-1001".to_string();
-        let elevated_process = "S-1-5-21-1-2-3-500".to_string();
-        assert_ne!(cashier, elevated_process);
-        assert_eq!(
-            unique_active_sid(vec![cashier.clone(), cashier.clone()]).unwrap(),
-            cashier
-        );
-        assert!(unique_active_sid(vec![]).is_err());
-        assert!(unique_active_sid(vec![cashier, elevated_process]).is_err());
-    }
-}
-
 fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<()> {
     if !user_sid.starts_with("S-1-")
         || !user_sid
@@ -466,4 +448,22 @@ pub fn protect_data_dir_for_user(dir: &Path, user_sid: &str) -> io::Result<()> {
 
 pub fn protect_file_for_user(path: &Path, user_sid: &str) -> io::Result<()> {
     set_private_dacl(path, user_sid, false)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::unique_active_sid;
+
+    #[test]
+    fn only_one_active_cashier_is_selected_even_if_the_process_is_elevated() {
+        let cashier = "S-1-5-21-1-2-3-1001".to_string();
+        let elevated_process = "S-1-5-21-1-2-3-500".to_string();
+        assert_ne!(cashier, elevated_process);
+        assert_eq!(
+            unique_active_sid(vec![cashier.clone(), cashier.clone()]).unwrap(),
+            cashier
+        );
+        assert!(unique_active_sid(vec![]).is_err());
+        assert!(unique_active_sid(vec![cashier, elevated_process]).is_err());
+    }
 }
