@@ -367,18 +367,17 @@ impl SettingsStore {
 
     #[cfg(not(windows))]
     fn load_with_acl(_: ()) -> Self {
-        let (settings, unreadable) = load_from_disk();
-        let issue = unreadable.then(|| {
-            "Configuration is unreadable; repair the file and restart the bridge.".to_string()
-        });
-        Self::finish_load(settings, issue)
+        let (settings, _) = load_from_disk();
+        Self::finish_load(settings, None)
     }
 
     fn finish_load(
         mut settings: Settings,
-        mut security_issue: Option<String>,
+        security_issue: Option<String>,
         #[cfg(windows)] acl_user_sid: Option<String>,
     ) -> Self {
+        #[cfg(windows)]
+        let mut security_issue = security_issue;
         if settings.local_secret.is_none() {
             match generate_secret() {
                 Ok(secret) => {
@@ -393,6 +392,7 @@ impl SettingsStore {
                             // and the POS keeps printing through the origin check.
                             // It just has to be re-issued on the next boot.
                             tracing::error!(err = %e, "could not persist the generated local secret");
+                            #[cfg(windows)]
                             security_issue = Some("La configuración necesita reparación: ejecuta la reparación como administrador y reinicia el bridge.".to_string());
                         }
                     }
