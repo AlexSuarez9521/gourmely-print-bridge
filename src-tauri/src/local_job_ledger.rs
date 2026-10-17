@@ -4,8 +4,11 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
-    sync::{Mutex, MutexGuard},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, MutexGuard,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +55,9 @@ struct Inner {
 
 pub struct LocalJobLedger {
     _lock: InstanceLock,
+    path: PathBuf,
     inner: Mutex<Inner>,
+    available: AtomicBool,
 }
 
 impl LocalJobLedger {
@@ -62,64 +67,28 @@ impl LocalJobLedger {
 
     fn open_with_sync(
         path: impl AsRef<Path>,
-        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+        sync_ledger_parent: impl FnOnce(&Path) -> io::Result<()>,
     ) -> BridgeResult<Self> {
         let path = path.as_ref();
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        let parent = parent_dir(path);
         std::fs::create_dir_all(parent)?;
         let lock = InstanceLock::acquire(path.with_extension("lock"))?;
+        durable_probe(path, sync_parent)?;
         let (mut file, _) = open_file(path)?;
         // A Fresh claim must never precede durable creation of its ledger name.
         // Re-sync on every open so a previous failed sync cannot be bypassed.
         file.sync_all()?;
-        sync_parent(parent)?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            return Err(BridgeError::Config(
-                "local print ledger has a torn final record".into(),
-            ));
-        }
-
-        let mut seen: HashMap<String, Record> = HashMap::new();
-        for line in bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let record: Record = serde_json::from_slice(line).map_err(|error| {
-                BridgeError::Config(format!("local print ledger has an invalid record: {error}"))
-            })?;
-            if record.version != FORMAT_VERSION
-                || record.intent_id.is_empty()
-                || record.intent_id.len() > MAX_INTENT_ID_BYTES
-                || record.fingerprint.is_empty()
-            {
-                return Err(BridgeError::Config(
-                    "local print ledger has an unsupported record".into(),
-                ));
-            }
-            if let Some(previous) = seen.get(&record.intent_id) {
-                if previous.fingerprint != record.fingerprint
-                    || (previous.outcome.is_some() && previous.outcome != record.outcome)
-                {
-                    return Err(BridgeError::Config(
-                        "local print ledger has conflicting records".into(),
-                    ));
-                }
-            }
-            seen.insert(record.intent_id.clone(), record);
-        }
+        sync_ledger_parent(parent)?;
+        let seen = load_records(&mut file)?;
         Ok(Self {
             _lock: lock,
+            path: path.to_path_buf(),
             inner: Mutex::new(Inner {
                 file,
                 seen,
                 blocked: false,
             }),
+            available: AtomicBool::new(true),
         })
     }
 
@@ -145,7 +114,7 @@ impl LocalJobLedger {
             fingerprint: fingerprint.into(),
             outcome: None,
         };
-        append(&mut inner, &record)?;
+        append(&mut inner, &record, &self.available)?;
         inner.seen.insert(intent_id.into(), record);
         Ok(Claim::Fresh)
     }
@@ -163,8 +132,54 @@ impl LocalJobLedger {
         }
         let mut record = previous.clone();
         record.outcome = Some(outcome);
-        append(&mut inner, &record)?;
+        append(&mut inner, &record, &self.available)?;
         inner.seen.insert(intent_id.into(), record);
+        Ok(())
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire) && !self.inner.is_poisoned()
+    }
+
+    /// Reuse the existing process lock and ledger object: in-flight sockets
+    /// may still hold an Arc to this value while storage is repaired.
+    pub fn recover(&self) -> BridgeResult<()> {
+        self.recover_with_sync(sync_parent)
+    }
+
+    fn recover_with_sync(
+        &self,
+        sync_probe_parent: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> BridgeResult<()> {
+        let mut inner = self.inner()?;
+        if !inner.blocked {
+            return Ok(());
+        }
+        durable_probe(&self.path, sync_probe_parent)?;
+        // Never recreate a missing journal: that could turn a printed intent
+        // into Fresh. The retained lock protects this same journal identity.
+        let mut file = open_existing_file(&self.path)?;
+        file.sync_all()?;
+        sync_parent(parent_dir(&self.path))?;
+        let seen = load_records(&mut file)?;
+        for (id, previous) in &inner.seen {
+            let Some(reloaded) = seen.get(id) else {
+                return Err(BridgeError::Config(
+                    "local print ledger lost a previously durable intent".into(),
+                ));
+            };
+            if previous.fingerprint != reloaded.fingerprint
+                || (previous.outcome.is_some() && previous.outcome != reloaded.outcome)
+            {
+                return Err(BridgeError::Config(
+                    "local print ledger changed a previously durable intent".into(),
+                ));
+            }
+        }
+        inner.file = file;
+        inner.seen = seen;
+        inner.blocked = false;
+        self.available.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -173,6 +188,88 @@ impl LocalJobLedger {
             .lock()
             .map_err(|_| BridgeError::Config("local print ledger lock is poisoned".into()))
     }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn load_records(file: &mut File) -> BridgeResult<HashMap<String, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        return Err(BridgeError::Config(
+            "local print ledger has a torn final record".into(),
+        ));
+    }
+    let mut seen: HashMap<String, Record> = HashMap::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let record: Record = serde_json::from_slice(line).map_err(|error| {
+            BridgeError::Config(format!("local print ledger has an invalid record: {error}"))
+        })?;
+        if record.version != FORMAT_VERSION
+            || record.intent_id.is_empty()
+            || record.intent_id.len() > MAX_INTENT_ID_BYTES
+            || record.fingerprint.is_empty()
+        {
+            return Err(BridgeError::Config(
+                "local print ledger has an unsupported record".into(),
+            ));
+        }
+        if let Some(previous) = seen.get(&record.intent_id) {
+            if previous.fingerprint != record.fingerprint
+                || (previous.outcome.is_some() && previous.outcome != record.outcome)
+            {
+                return Err(BridgeError::Config(
+                    "local print ledger has conflicting records".into(),
+                ));
+            }
+        }
+        seen.insert(record.intent_id.clone(), record);
+    }
+    Ok(seen)
+}
+
+fn durable_probe(path: &Path, sync_dir: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
+    let parent = parent_dir(path);
+    let probe = parent.join(format!(".local-print-probe-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x8000_0000); // FILE_FLAG_WRITE_THROUGH
+        }
+        let mut file = options.open(&probe)?;
+        file.write_all(b"durability probe\n")?;
+        file.sync_all()?;
+        drop(file);
+        sync_dir(parent)?;
+        std::fs::remove_file(&probe)?;
+        sync_parent(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&probe);
+    }
+    result
+}
+
+fn open_existing_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x8000_0000);
+    }
+    options.open(path)
 }
 
 fn open_file(path: &Path) -> io::Result<(File, bool)> {
@@ -214,7 +311,7 @@ fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn append(inner: &mut Inner, record: &Record) -> BridgeResult<()> {
+fn append(inner: &mut Inner, record: &Record, available: &AtomicBool) -> BridgeResult<()> {
     if inner.blocked {
         return Err(BridgeError::Config(
             "local print ledger is blocked after a write failure".into(),
@@ -229,6 +326,7 @@ fn append(inner: &mut Inner, record: &Record) -> BridgeResult<()> {
         .and_then(|_| inner.file.sync_all())
     {
         inner.blocked = true;
+        available.store(false, Ordering::Release);
         return Err(BridgeError::Io(error));
     }
     Ok(())
@@ -239,7 +337,8 @@ mod tests {
     use std::{
         io,
         path::PathBuf,
-        sync::{Arc, Barrier},
+        sync::{mpsc, Arc, Barrier},
+        time::Duration,
     };
 
     use super::{open_file, Claim, LocalJobLedger, Outcome};
@@ -443,6 +542,118 @@ mod tests {
                 .claim("intent-6", "digest")
                 .unwrap(),
             Claim::Interrupted
+        );
+    }
+
+    #[test]
+    fn blocked_ledger_recovers_in_place_only_after_a_durable_probe() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).expect("open ledger");
+        assert_eq!(ledger.claim("printing", "digest").unwrap(), Claim::Fresh);
+        ledger.inner.lock().unwrap().file = std::fs::File::open(&path).unwrap();
+        assert!(ledger
+            .finish(
+                "printing",
+                Outcome {
+                    job_id: 7,
+                    error: None,
+                },
+            )
+            .is_err());
+        assert!(!ledger.is_available());
+        assert!(LocalJobLedger::open(&path).is_err(), "the lock stays held");
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(ledger
+            .recover_with_sync(|_| Err(io::Error::other("probe sync failed")))
+            .is_err());
+        assert!(!ledger.is_available());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        ledger.recover().expect("repaired storage");
+        assert!(ledger.is_available());
+        assert_eq!(
+            ledger.claim("printing", "digest").unwrap(),
+            Claim::Interrupted
+        );
+        assert_eq!(ledger.claim("new", "digest").unwrap(), Claim::Fresh);
+    }
+
+    #[test]
+    fn recovery_refuses_a_replaced_ledger_that_lost_prior_claims() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        assert_eq!(ledger.claim("stable", "digest").unwrap(), Claim::Fresh);
+        ledger.inner.lock().unwrap().file = std::fs::File::open(&path).unwrap();
+        assert!(ledger.claim("blocked", "digest").is_err());
+        std::fs::write(&path, b"").unwrap();
+        assert!(ledger.recover().is_err());
+        assert!(!ledger.is_available());
+        assert!(ledger.claim("another", "digest").is_err());
+    }
+
+    #[test]
+    fn availability_does_not_wait_for_a_durable_recovery_probe() {
+        let path = ledger_path();
+        let ledger = Arc::new(LocalJobLedger::open(&path).unwrap());
+        ledger.inner.lock().unwrap().file = std::fs::File::open(&path).unwrap();
+        assert!(ledger.claim("blocked", "digest").is_err());
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let recovering = Arc::clone(&ledger);
+        let recovery = std::thread::spawn(move || {
+            recovering.recover_with_sync(|parent| {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                super::sync_parent(parent)
+            })
+        });
+        entered_rx.recv().unwrap();
+        let (available_tx, available_rx) = mpsc::channel();
+        let checking = Arc::clone(&ledger);
+        let check = std::thread::spawn(move || available_tx.send(checking.is_available()).unwrap());
+        let observed = available_rx.recv_timeout(Duration::from_millis(150));
+        resume_tx.send(()).unwrap();
+        recovery.join().unwrap().unwrap();
+        check.join().unwrap();
+        assert!(!observed.unwrap(), "availability blocked an async caller");
+        assert!(ledger.is_available());
+    }
+
+    #[test]
+    fn a_bare_relative_ledger_name_opens_in_the_current_directory() {
+        if std::env::var_os("BRIDGE_RELATIVE_LEDGER_CHILD").is_some() {
+            let ledger = LocalJobLedger::open("local-print-intents.jsonl").unwrap();
+            assert_eq!(ledger.claim("relative", "digest").unwrap(), Claim::Fresh);
+            ledger.inner.lock().unwrap().file =
+                std::fs::File::open("local-print-intents.jsonl").unwrap();
+            assert!(ledger.claim("blocked", "digest").is_err());
+            ledger.recover().unwrap();
+            assert_eq!(
+                ledger.claim("relative", "digest").unwrap(),
+                Claim::Interrupted
+            );
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("bridge-relative-ledger-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_job_ledger::tests::a_bare_relative_ledger_name_opens_in_the_current_directory",
+                "--nocapture",
+            ])
+            .env("BRIDGE_RELATIVE_LEDGER_CHILD", "1")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
