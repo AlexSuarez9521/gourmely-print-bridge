@@ -17,6 +17,7 @@
 //! [`run`] and [`instance_lock`] — two bridges on one till print every ticket
 //! twice, and the relay is what made that reachable.
 
+pub mod acl_repair;
 pub mod config;
 pub mod engineio;
 pub mod error;
