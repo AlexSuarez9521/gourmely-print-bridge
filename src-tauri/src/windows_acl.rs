@@ -246,10 +246,11 @@ fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<
     result
 }
 
-const SENSITIVE_FILES: [&str; 7] = [
+const SENSITIVE_FILES: [&str; 8] = [
     "config.json",
     "config.json.tmp",
     "local-print-intents.jsonl",
+    "local-print-intents.jsonl.tmp",
     "local-print-intents.lock",
     "print-jobs.jsonl",
     "print-jobs.jsonl.tmp",
@@ -448,6 +449,55 @@ pub fn protect_data_dir_for_user(dir: &Path, user_sid: &str) -> io::Result<()> {
 
 pub fn protect_file_for_user(path: &Path, user_sid: &str) -> io::Result<()> {
     set_private_dacl(path, user_sid, false)
+}
+
+/// A compaction temp must have the existing ledger's DACL before any record is
+/// written. This copies rights; it does not choose or repair a cashier SID.
+pub fn preserve_ledger_acl_for_temp(source: &Path, temp: &Path) -> io::Result<()> {
+    let source_wide = wide(source.as_os_str());
+    let temp_wide = wide(temp.as_os_str());
+    let mut descriptor = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: Windows owns descriptor/dacl until LocalFree below.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            source_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(win_error(code));
+    }
+    let result = if dacl.is_null() || descriptor.is_null() {
+        Err(ambiguous_acl())
+    } else {
+        // SAFETY: dacl points into the live source descriptor for this call.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                temp_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(win_error(code))
+        }
+    };
+    // SAFETY: descriptor was allocated by GetNamedSecurityInfoW.
+    unsafe { LocalFree(descriptor) };
+    result
 }
 
 #[cfg(test)]

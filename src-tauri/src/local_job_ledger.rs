@@ -20,6 +20,10 @@ use crate::{
 
 const FORMAT_VERSION: u8 = 1;
 const MAX_INTENT_ID_BYTES: usize = 128;
+// Compaction removes repeated transitions, never an intent ID. Until the API
+// defines a replay horizon, the number of unique IDs can only grow.
+const COMPACT_AFTER_REDUNDANT_LINES: usize = if cfg!(test) { 8 } else { 1_024 };
+const COMPACT_RETRY_AFTER_LINES: usize = if cfg!(test) { 8 } else { 256 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
@@ -49,6 +53,8 @@ struct Record {
 struct Inner {
     file: File,
     seen: HashMap<String, Record>,
+    lines: usize,
+    compact_retry_at: usize,
     /// A partial write or failed fsync makes future claims unsafe in this process.
     blocked: bool,
 }
@@ -79,13 +85,15 @@ impl LocalJobLedger {
         // Re-sync on every open so a previous failed sync cannot be bypassed.
         file.sync_all()?;
         sync_ledger_parent(parent)?;
-        let seen = load_records(&mut file)?;
+        let (seen, lines) = load_records(&mut file)?;
         Ok(Self {
             _lock: lock,
             path: path.to_path_buf(),
             inner: Mutex::new(Inner {
                 file,
                 seen,
+                lines,
+                compact_retry_at: 0,
                 blocked: false,
             }),
             available: AtomicBool::new(true),
@@ -116,6 +124,7 @@ impl LocalJobLedger {
         };
         append(&mut inner, &record, &self.available)?;
         inner.seen.insert(intent_id.into(), record);
+        compact_best_effort(&mut inner, &self.path, &self.available)?;
         Ok(Claim::Fresh)
     }
 
@@ -134,6 +143,7 @@ impl LocalJobLedger {
         record.outcome = Some(outcome);
         append(&mut inner, &record, &self.available)?;
         inner.seen.insert(intent_id.into(), record);
+        compact_best_effort(&mut inner, &self.path, &self.available)?;
         Ok(())
     }
 
@@ -166,7 +176,7 @@ impl LocalJobLedger {
         let mut file = open_existing_file(&self.path)?;
         file.sync_all()?;
         sync_parent(parent_dir(&self.path))?;
-        let seen = load_records(&mut file)?;
+        let (seen, lines) = load_records(&mut file)?;
         for (id, previous) in &inner.seen {
             let Some(reloaded) = seen.get(id) else {
                 return Err(BridgeError::Config(
@@ -183,6 +193,8 @@ impl LocalJobLedger {
         }
         inner.file = file;
         inner.seen = seen;
+        inner.lines = lines;
+        inner.compact_retry_at = 0;
         inner.blocked = false;
         self.available.store(true, Ordering::Release);
         Ok(())
@@ -201,7 +213,7 @@ fn parent_dir(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
-fn load_records(file: &mut File) -> BridgeResult<HashMap<String, Record>> {
+fn load_records(file: &mut File) -> BridgeResult<(HashMap<String, Record>, usize)> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -211,10 +223,12 @@ fn load_records(file: &mut File) -> BridgeResult<HashMap<String, Record>> {
         ));
     }
     let mut seen: HashMap<String, Record> = HashMap::new();
+    let mut lines = 0;
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
+        lines += 1;
         let record: Record = serde_json::from_slice(line).map_err(|error| {
             BridgeError::Config(format!("local print ledger has an invalid record: {error}"))
         })?;
@@ -238,7 +252,7 @@ fn load_records(file: &mut File) -> BridgeResult<HashMap<String, Record>> {
         }
         seen.insert(record.intent_id.clone(), record);
     }
-    Ok(seen)
+    Ok((seen, lines))
 }
 
 fn durable_probe(path: &Path, sync_dir: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
@@ -316,6 +330,154 @@ fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn compact_best_effort(inner: &mut Inner, path: &Path, available: &AtomicBool) -> BridgeResult<()> {
+    compact_best_effort_with_sync(inner, path, available, sync_parent)
+}
+
+fn compact_best_effort_with_sync(
+    inner: &mut Inner,
+    path: &Path,
+    available: &AtomicBool,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> BridgeResult<()> {
+    if inner.blocked
+        || inner.lines < inner.compact_retry_at
+        || inner.lines.saturating_sub(inner.seen.len()) < COMPACT_AFTER_REDUNDANT_LINES
+    {
+        return Ok(());
+    }
+    if let Err(error) = compact_with_sync(inner, path, available, sync_dir) {
+        inner.compact_retry_at = inner.lines.saturating_add(COMPACT_RETRY_AFTER_LINES);
+        if inner.blocked {
+            return Err(error);
+        }
+        tracing::warn!(%error, path = %path.display(), "local intent compaction deferred without evicting IDs");
+    }
+    Ok(())
+}
+
+fn compact_with_sync(
+    inner: &mut Inner,
+    path: &Path,
+    available: &AtomicBool,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> BridgeResult<()> {
+    compact_with_io(
+        inner,
+        path,
+        available,
+        sync_dir,
+        write_compacted_records,
+        |from, to| std::fs::rename(from, to),
+    )
+}
+
+fn write_compacted_records(file: &mut File, seen: &HashMap<String, Record>) -> BridgeResult<()> {
+    let mut ids: Vec<_> = seen.keys().collect();
+    ids.sort();
+    for id in ids {
+        serde_json::to_writer(&mut *file, &seen[id]).map_err(|error| {
+            BridgeError::Config(format!("cannot encode compacted print intent: {error}"))
+        })?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn compact_with_io(
+    inner: &mut Inner,
+    path: &Path,
+    available: &AtomicBool,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+    write_records: impl FnOnce(&mut File, &HashMap<String, Record>) -> BridgeResult<()>,
+    replace: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> BridgeResult<()> {
+    if inner.blocked {
+        return Err(BridgeError::Config("local print ledger is blocked".into()));
+    }
+    // Re-read the durable journal rather than serializing only this process's
+    // map. The retained process lock prevents another bridge from writing it.
+    let loaded = open_existing_file(path)
+        .map_err(BridgeError::from)
+        .and_then(|mut file| load_records(&mut file));
+    let (seen, _) = match loaded {
+        Ok(records) => records,
+        Err(error) => {
+            inner.blocked = true;
+            available.store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
+    for (id, previous) in &inner.seen {
+        let Some(on_disk) = seen.get(id) else {
+            inner.blocked = true;
+            available.store(false, Ordering::Release);
+            return Err(BridgeError::Config(
+                "local print ledger lost a durable intent".into(),
+            ));
+        };
+        if previous.fingerprint != on_disk.fingerprint
+            || (previous.outcome.is_some() && previous.outcome != on_disk.outcome)
+        {
+            inner.blocked = true;
+            available.store(false, Ordering::Release);
+            return Err(BridgeError::Config(
+                "local print ledger changed a durable intent".into(),
+            ));
+        }
+    }
+
+    let tmp = path.with_extension("jsonl.tmp");
+    // Only this process owns the ledger lock; a leftover temp after a crash is
+    // not authoritative and must not prevent future compaction attempts.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let written = (|| -> BridgeResult<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x8000_0000); // FILE_FLAG_WRITE_THROUGH
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(windows)]
+        crate::windows_acl::preserve_ledger_acl_for_temp(path, &tmp)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&tmp, std::fs::metadata(path)?.permissions())?;
+        write_records(&mut file, &seen)?;
+        file.sync_all()?;
+        Ok(file)
+    })();
+    let file = match written {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+    };
+    if let Err(error) = replace(&tmp, path) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    // After rename, the old append handle points at the replaced file. Any
+    // durability error must block appends until recovery reopens this path.
+    if let Err(error) = sync_dir(parent_dir(path)) {
+        inner.blocked = true;
+        available.store(false, Ordering::Release);
+        return Err(error.into());
+    }
+    inner.file = file;
+    inner.lines = seen.len();
+    inner.seen = seen;
+    inner.compact_retry_at = 0;
+    Ok(())
+}
+
 fn append(inner: &mut Inner, record: &Record, available: &AtomicBool) -> BridgeResult<()> {
     if inner.blocked {
         return Err(BridgeError::Config(
@@ -334,6 +496,7 @@ fn append(inner: &mut Inner, record: &Record, available: &AtomicBool) -> BridgeR
         available.store(false, Ordering::Release);
         return Err(BridgeError::Io(error));
     }
+    inner.lines += 1;
     Ok(())
 }
 
@@ -346,7 +509,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{open_file, Claim, LocalJobLedger, Outcome};
+    use super::{
+        compact_best_effort_with_sync, compact_with_io, compact_with_sync, open_file, Claim,
+        LocalJobLedger, Outcome, COMPACT_AFTER_REDUNDANT_LINES,
+    };
 
     fn ledger_path() -> PathBuf {
         let dir =
@@ -444,6 +610,174 @@ mod tests {
             reopened.claim("intent-2", "digest").unwrap(),
             Claim::Done(outcome)
         );
+    }
+
+    #[test]
+    fn repeated_transitions_compact_without_forgetting_any_intent() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        for index in 0..10 {
+            let id = format!("completed-{index}");
+            let fingerprint = format!("payload-{index}");
+            assert_eq!(ledger.claim(&id, &fingerprint).unwrap(), Claim::Fresh);
+            ledger
+                .finish(
+                    &id,
+                    Outcome {
+                        job_id: index + 1,
+                        error: (index == 3).then(|| "printer offline".into()),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(ledger.claim("uncertain", "pending").unwrap(), Claim::Fresh);
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert!(lines <= 15, "redundant transition lines remained: {lines}");
+        drop(ledger);
+
+        let reopened = LocalJobLedger::open(&path).unwrap();
+        for index in 0..10 {
+            let id = format!("completed-{index}");
+            let fingerprint = format!("payload-{index}");
+            assert_eq!(
+                reopened.claim(&id, &fingerprint).unwrap(),
+                Claim::Done(Outcome {
+                    job_id: index + 1,
+                    error: (index == 3).then(|| "printer offline".into()),
+                })
+            );
+            assert_eq!(reopened.claim(&id, "different").unwrap(), Claim::Conflict);
+        }
+        assert_eq!(
+            reopened.claim("uncertain", "pending").unwrap(),
+            Claim::Interrupted
+        );
+    }
+
+    #[test]
+    fn failed_temp_creation_preserves_bytes_and_existing_claims() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        assert_eq!(ledger.claim("stable", "digest").unwrap(), Claim::Fresh);
+        let before = std::fs::read(&path).unwrap();
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(compact_with_sync(
+            &mut ledger.inner.lock().unwrap(),
+            &path,
+            &ledger.available,
+            super::sync_parent,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(ledger.is_available());
+        assert_eq!(
+            ledger.claim("stable", "digest").unwrap(),
+            Claim::Interrupted
+        );
+        std::fs::remove_dir(&tmp).unwrap();
+    }
+
+    #[test]
+    fn partial_temp_write_or_failed_rename_keeps_the_prior_journal() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        assert_eq!(ledger.claim("stable", "digest").unwrap(), Claim::Fresh);
+        let before = std::fs::read(&path).unwrap();
+        let tmp = path.with_extension("jsonl.tmp");
+
+        assert!(compact_with_io(
+            &mut ledger.inner.lock().unwrap(),
+            &path,
+            &ledger.available,
+            super::sync_parent,
+            |file, _| {
+                use std::io::Write;
+                file.write_all(b"partial")?;
+                Err(crate::error::BridgeError::Io(io::Error::other("disk full")))
+            },
+            |from, to| std::fs::rename(from, to),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!tmp.exists());
+
+        assert!(compact_with_io(
+            &mut ledger.inner.lock().unwrap(),
+            &path,
+            &ledger.available,
+            super::sync_parent,
+            super::write_compacted_records,
+            |_, _| Err(io::Error::other("rename failed")),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!tmp.exists());
+        assert!(ledger.is_available());
+        assert_eq!(
+            ledger.claim("stable", "digest").unwrap(),
+            Claim::Interrupted
+        );
+    }
+
+    #[test]
+    fn failed_directory_sync_after_replace_blocks_until_recovery() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        assert_eq!(ledger.claim("stable", "digest").unwrap(), Claim::Fresh);
+        ledger
+            .finish(
+                "stable",
+                Outcome {
+                    job_id: 74,
+                    error: None,
+                },
+            )
+            .unwrap();
+        let result = compact_with_sync(
+            &mut ledger.inner.lock().unwrap(),
+            &path,
+            &ledger.available,
+            |_| Err(io::Error::other("directory sync failed")),
+        );
+        assert!(result.is_err());
+        assert!(!ledger.is_available());
+        assert!(ledger.claim("new", "digest").is_err());
+        ledger.recover().unwrap();
+        assert_eq!(
+            ledger.claim("stable", "digest").unwrap(),
+            Claim::Done(Outcome {
+                job_id: 74,
+                error: None,
+            })
+        );
+        drop(ledger);
+        assert_eq!(
+            LocalJobLedger::open(&path)
+                .unwrap()
+                .claim("stable", "digest")
+                .unwrap(),
+            Claim::Done(Outcome {
+                job_id: 74,
+                error: None,
+            })
+        );
+    }
+
+    #[test]
+    fn post_replace_sync_failure_is_not_reported_as_a_fresh_claim() {
+        let path = ledger_path();
+        let ledger = LocalJobLedger::open(&path).unwrap();
+        assert_eq!(ledger.claim("stable", "digest").unwrap(), Claim::Fresh);
+        let mut inner = ledger.inner.lock().unwrap();
+        inner.lines = inner.seen.len() + COMPACT_AFTER_REDUNDANT_LINES;
+        let result = compact_best_effort_with_sync(&mut inner, &path, &ledger.available, |_| {
+            Err(io::Error::other("directory sync failed"))
+        });
+        assert!(result.is_err(), "a post-replace failure must fail closed");
+        drop(inner);
+        assert!(!ledger.is_available());
+        assert!(ledger.claim("another", "digest").is_err());
     }
 
     #[test]
