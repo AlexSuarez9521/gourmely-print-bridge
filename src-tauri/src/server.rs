@@ -62,7 +62,12 @@
 //! it is a worse one: a router blip would tell the POS the bridge is missing and
 //! stop the local printing that still works perfectly.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{
@@ -102,10 +107,85 @@ pub struct ServerState {
     /// router on its own — `/health` then reports the relay as `unknown` rather
     /// than inventing a healthy-looking answer.
     pub relay: Option<RelayHandle>,
-    /// Available only when durable local intent storage opened successfully.
-    pub local_ledger: Option<Arc<LocalJobLedger>>,
+    /// Advertised only while durable local intent storage is writable.
+    local_ledger: Arc<LocalLedgerManager>,
     pub print_raw: Arc<PrintRawFn>,
     pub print_slots: Arc<Semaphore>,
+}
+
+struct LocalLedgerManager {
+    path: Option<PathBuf>,
+    ledger: RwLock<Option<Arc<LocalJobLedger>>>,
+}
+
+impl LocalLedgerManager {
+    fn from_path(path: Option<PathBuf>) -> Self {
+        let ledger = open_local_ledger(path.clone());
+        Self {
+            path,
+            ledger: RwLock::new(ledger),
+        }
+    }
+
+    fn from_ledger(ledger: Option<Arc<LocalJobLedger>>) -> Self {
+        Self {
+            path: None,
+            ledger: RwLock::new(ledger),
+        }
+    }
+
+    fn available(&self) -> Option<Arc<LocalJobLedger>> {
+        self.ledger
+            .read()
+            .ok()?
+            .as_ref()
+            .filter(|ledger| ledger.is_available())
+            .cloned()
+    }
+
+    fn needs_retry(&self) -> bool {
+        self.available().is_none()
+            && (self.path.is_some() || self.ledger.read().is_ok_and(|ledger| ledger.is_some()))
+    }
+
+    fn retry(&self) -> BridgeResult<()> {
+        let current = self
+            .ledger
+            .read()
+            .map_err(|_| BridgeError::Config("local ledger manager lock is poisoned".into()))?
+            .clone();
+        if let Some(ledger) = current {
+            return ledger.recover();
+        }
+        let path = self.path.as_ref().ok_or_else(|| {
+            BridgeError::Config("local print intent data directory is unavailable".into())
+        })?;
+        let reopened = Arc::new(LocalJobLedger::open(path)?);
+        *self
+            .ledger
+            .write()
+            .map_err(|_| BridgeError::Config("local ledger manager lock is poisoned".into()))? =
+            Some(reopened);
+        Ok(())
+    }
+}
+
+async fn local_ledger_recovery_loop(manager: Arc<LocalLedgerManager>, interval: Duration) {
+    let mut ticks = tokio::time::interval(interval);
+    loop {
+        ticks.tick().await;
+        if !manager.needs_retry() {
+            continue;
+        }
+        let retrying = Arc::clone(&manager);
+        match tokio::task::spawn_blocking(move || retrying.retry()).await {
+            Ok(Ok(())) => tracing::info!("durable local print intents recovered"),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "durable local print intents remain unavailable")
+            }
+            Err(error) => tracing::error!(%error, "local intent recovery task failed"),
+        }
+    }
 }
 
 /// `?token=…` on the upgrade URL.
@@ -212,6 +292,32 @@ struct HealthResponse {
     relay: HealthRelay,
     /// A failed Windows credential migration never silently looks healthy.
     configuration_security: Option<String>,
+    local_print_intents: HealthLocalPrintIntents,
+}
+
+#[derive(Serialize)]
+struct HealthLocalPrintIntents {
+    ok: bool,
+    needs_attention: bool,
+    detail: &'static str,
+}
+
+impl HealthLocalPrintIntents {
+    fn of(manager: &LocalLedgerManager) -> Self {
+        if manager.available().is_some() {
+            Self {
+                ok: true,
+                needs_attention: false,
+                detail: "La impresión local con ID está disponible.",
+            }
+        } else {
+            Self {
+                ok: false,
+                needs_attention: true,
+                detail: "Impresión segura pausada: revise permisos y espacio del directorio de datos; ejecute la reparación como administrador o contacte soporte. No borre el historial de impresiones.",
+            }
+        }
+    }
 }
 
 /// The relay, as `/health` reports it.
@@ -395,6 +501,7 @@ async fn health_handler(State(s): State<ServerState>) -> Json<HealthResponse> {
         printer_count,
         relay: HealthRelay::of(s.relay.as_ref()),
         configuration_security: s.settings.security_issue().map(str::to_owned),
+        local_print_intents: HealthLocalPrintIntents::of(&s.local_ledger),
     })
 }
 
@@ -479,7 +586,7 @@ async fn handle_text(text: &str, state: &ServerState) -> WsResponse {
                 id,
                 ok: true,
                 printers,
-                capabilities: state.local_ledger.as_ref().map(|_| PrintCapabilities {
+                capabilities: state.local_ledger.available().map(|_| PrintCapabilities {
                     print_intent_id: true,
                 }),
             },
@@ -553,7 +660,7 @@ fn print_with_intent(
     bytes: &[u8],
     intent_id: String,
 ) -> WsResponse {
-    let Some(ledger) = state.local_ledger.as_ref() else {
+    let Some(ledger) = state.local_ledger.available() else {
         return WsResponse::err(request_id, "local print intent ledger unavailable");
     };
     let mut digest = Sha256::new();
@@ -640,9 +747,9 @@ pub async fn serve(
         version: env!("CARGO_PKG_VERSION"),
         settings,
         relay,
-        local_ledger: open_local_ledger(
+        local_ledger: Arc::new(LocalLedgerManager::from_path(
             crate::config::data_dir().map(|dir| dir.join("local-print-intents.jsonl")),
-        ),
+        )),
         print_raw: Arc::new(printer::print_raw),
         print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     };
@@ -662,10 +769,13 @@ pub async fn serve(
     let addr: SocketAddr = ([127, 0, 0, 1], bind_port()).into();
     tracing::info!("listening on https://{}", addr);
 
-    axum_server::bind_rustls(addr, tls)
-        .serve(build_router(state).into_make_service())
-        .await
-        .map_err(|e| BridgeError::Io(std::io::Error::other(e)))?;
+    let recovery = Arc::clone(&state.local_ledger);
+    tokio::select! {
+        result = axum_server::bind_rustls(addr, tls).serve(build_router(state).into_make_service()) => {
+            result.map_err(|e| BridgeError::Io(std::io::Error::other(e)))?;
+        }
+        _ = local_ledger_recovery_loop(recovery, Duration::from_secs(5)) => unreachable!(),
+    }
     Ok(())
 }
 
@@ -688,7 +798,7 @@ pub fn router_with_settings(settings: crate::config::Settings) -> Router {
         version: "test",
         settings: SettingsStore::in_memory(settings),
         relay: None,
-        local_ledger: None,
+        local_ledger: Arc::new(LocalLedgerManager::from_ledger(None)),
         print_raw: Arc::new(printer::print_raw),
         print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
@@ -706,7 +816,7 @@ pub fn router_with_relay(relay: RelayHandle) -> Router {
             ..Default::default()
         }),
         relay: Some(relay),
-        local_ledger: None,
+        local_ledger: Arc::new(LocalLedgerManager::from_ledger(None)),
         print_raw: Arc::new(printer::print_raw),
         print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
     })
@@ -739,7 +849,7 @@ mod tests {
             })
             .with_security_issue("Run the bridge once as administrator, then restart normally."),
             relay: None,
-            local_ledger: None,
+            local_ledger: Arc::new(LocalLedgerManager::from_ledger(None)),
             print_raw: Arc::new(printer::print_raw),
             print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         };
@@ -794,9 +904,11 @@ mod tests {
             .expect("bind test server");
         let url = format!("ws://{}/print", listener.local_addr().expect("address"));
         let server = tokio::spawn(async move {
-            axum::serve(listener, build_router(state))
-                .await
-                .expect("serve test socket");
+            let recovery = Arc::clone(&state.local_ledger);
+            tokio::select! {
+                result = axum::serve(listener, build_router(state)) => result.expect("serve test socket"),
+                _ = local_ledger_recovery_loop(recovery, Duration::from_millis(25)) => unreachable!(),
+            }
         });
         (server, url)
     }
@@ -825,7 +937,7 @@ mod tests {
                 ..Default::default()
             }),
             relay: None,
-            local_ledger: ledger,
+            local_ledger: Arc::new(LocalLedgerManager::from_ledger(ledger)),
             print_raw: fake.clone(),
             print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         };
@@ -955,6 +1067,170 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn repaired_storage_restores_intent_capability_on_the_same_socket() {
+        let path = std::env::temp_dir()
+            .join(format!("bridge-live-recovery-{}", uuid::Uuid::new_v4()))
+            .join("local-print-intents.jsonl");
+        std::fs::create_dir_all(&path).unwrap(); // A directory cannot be opened as a ledger file.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_printer: &str, _bytes: &[u8]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(84)
+            })
+        };
+        let state = ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings {
+                local_auth: LocalAuth::Off,
+                ..Default::default()
+            }),
+            relay: None,
+            local_ledger: Arc::new(LocalLedgerManager::from_path(Some(path.clone()))),
+            print_raw: fake,
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+        let (server, url) = ws_test_server(state).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let data = BASE64.encode(b"ticket");
+        let before = ws_exchange(&mut socket, serde_json::json!({"op":"list","id":"before"})).await;
+        assert!(before.get("capabilities").is_none());
+        let health_url = url.replace("ws://", "http://").replace("/print", "/health");
+        let health: serde_json::Value = reqwest::get(&health_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["local_print_intents"]["ok"], false);
+        assert!(health["local_print_intents"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("administrador"));
+        let unsupported = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print","id":"unsupported","printer":"Fake","data":data,
+                "printIntentId":"stable"
+            }),
+        )
+        .await;
+        assert_eq!(unsupported["ok"], false);
+        let legacy = ws_exchange(
+            &mut socket,
+            serde_json::json!({
+                "op":"print","id":"legacy","printer":"Fake","data":data
+            }),
+        )
+        .await;
+        assert_eq!(legacy["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir(&path).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let list = ws_exchange(
+                    &mut socket,
+                    serde_json::json!({
+                        "op":"list","id":"after"
+                    }),
+                )
+                .await;
+                if list["capabilities"]["printIntentId"] == true {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("same-process ledger recovery");
+        let health: serde_json::Value = reqwest::get(health_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["local_print_intents"]["ok"], true);
+        for attempt in ["first", "retry"] {
+            let response = ws_exchange(
+                &mut socket,
+                serde_json::json!({
+                    "op":"print","id":attempt,"printer":"Fake","data":data,
+                    "printIntentId":"stable"
+                }),
+            )
+            .await;
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["printIntentId"], "stable");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn live_ledger_write_failure_withdraws_capability_without_blocking_legacy_prints() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "bridge-live-ledger-failure-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("local-print-intents.jsonl");
+        let ledger = Arc::new(LocalJobLedger::open(path).unwrap());
+        let manager = Arc::new(LocalLedgerManager::from_ledger(Some(Arc::clone(&ledger))));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fake = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_printer: &str, _bytes: &[u8]| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(91)
+            })
+        };
+        let state = ServerState {
+            started_at: Instant::now(),
+            version: "test",
+            settings: SettingsStore::in_memory(Settings::default()),
+            relay: None,
+            local_ledger: Arc::clone(&manager),
+            print_raw: fake,
+            print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
+        };
+        ledger.fail_writes_for_tests();
+        let failed = handle_text(
+            &serde_json::json!({
+                "op":"print","id":"failed","printer":"Fake","data":BASE64.encode(b"ticket"),
+                "printIntentId":"stable"
+            })
+            .to_string(),
+            &state,
+        )
+        .await;
+        assert_eq!(serde_json::to_value(failed).unwrap()["ok"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let list = serde_json::to_value(handle_text(r#"{"op":"list","id":"list"}"#, &state).await)
+            .unwrap();
+        assert!(list.get("capabilities").is_none());
+        let health = serde_json::to_value(health_handler(State(state.clone())).await.0).unwrap();
+        assert_eq!(health["local_print_intents"]["ok"], false);
+        let legacy = handle_text(
+            &serde_json::json!({
+                "op":"print","id":"legacy","printer":"Fake","data":BASE64.encode(b"ticket")
+            })
+            .to_string(),
+            &state,
+        )
+        .await;
+        assert_eq!(serde_json::to_value(legacy).unwrap()["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        manager.retry().unwrap();
+        let list = serde_json::to_value(handle_text(r#"{"op":"list","id":"list"}"#, &state).await)
+            .unwrap();
+        assert_eq!(list["capabilities"]["printIntentId"], true);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_local_spooler_does_not_delay_health_or_another_socket() {
         use std::sync::atomic::AtomicBool;
@@ -986,7 +1262,7 @@ mod tests {
                     ..Default::default()
                 }),
                 relay: None,
-                local_ledger: ledger,
+                local_ledger: Arc::new(LocalLedgerManager::from_ledger(ledger)),
                 print_raw: fake,
                 print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
             };
@@ -1074,7 +1350,7 @@ mod tests {
                 ..Default::default()
             }),
             relay: None,
-            local_ledger: None,
+            local_ledger: Arc::new(LocalLedgerManager::from_ledger(None)),
             print_raw: Arc::new(printer::print_raw),
             print_slots: Arc::new(Semaphore::new(MAX_ACTIVE_LOCAL_PRINTS)),
         }

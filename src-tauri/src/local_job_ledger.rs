@@ -141,6 +141,11 @@ impl LocalJobLedger {
         self.available.load(Ordering::Acquire) && !self.inner.is_poisoned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_writes_for_tests(&self) {
+        self.inner.lock().unwrap().file = File::open(&self.path).unwrap();
+    }
+
     /// Reuse the existing process lock and ledger object: in-flight sockets
     /// may still hold an Arc to this value while storage is repaired.
     pub fn recover(&self) -> BridgeResult<()> {

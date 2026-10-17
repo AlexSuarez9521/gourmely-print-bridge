@@ -11,7 +11,7 @@ const csp = JSON.parse(
 async function openWithMockedTauri(
   browser: Browser,
   app: App,
-  scenario: 'printer-error' | 'update-version',
+  scenario: 'printer-error' | 'update-version' | 'ledger-unavailable',
 ) {
   await browser.route('http://127.0.0.1:1420/', async (route) => {
     await route.fulfill({
@@ -54,7 +54,15 @@ async function openWithMockedTauri(
       window.fetch = (input, init) =>
         String(input).endsWith('/health')
           ? Promise.resolve(
-              new Response(JSON.stringify({ ok: true, version: '0.1.5', printer_count: 1 }), {
+              new Response(JSON.stringify({
+                ok: true, version: '0.1.5', printer_count: 1,
+                ...(scenario === 'ledger-unavailable' ? {
+                  local_print_intents: {
+                    ok: false, needs_attention: true,
+                    detail: 'Impresión segura pausada: ejecute la reparación como administrador.',
+                  },
+                } : {}),
+              }), {
                 status: 200,
                 headers: { 'Content-Type': 'application/json' },
               }),
@@ -95,4 +103,10 @@ test('configured CSP blocks an inline script in the browser', async ({ app, brow
   await app.open('/csp-probe');
   await expect(browser.locator('#probe')).toHaveText('Loaded');
   expect(await browser.evaluate(() => (window as typeof window & { __bridgeXss?: number }).__bridgeXss)).toBeUndefined();
+});
+
+test('unavailable local intent ledger shows an actionable warning', async ({ app, browser }) => {
+  await openWithMockedTauri(browser, app, 'ledger-unavailable');
+  await expect(browser.locator('#conn-status')).toContainText('ejecute la reparación como administrador');
+  expect(await browser.evaluate(() => document.getElementById('status-dot')?.classList.contains('is-warn'))).toBe(true);
 });

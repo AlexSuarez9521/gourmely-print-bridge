@@ -79,6 +79,11 @@ interface HealthSnapshot {
   uptime_seconds: number;
   printer_count: number;
   configuration_security?: string | null;
+  local_print_intents?: {
+    ok: boolean;
+    needs_attention: boolean;
+    detail: string;
+  };
   relay?: {
     state: RelayStateName | 'unknown';
     ok: boolean;
@@ -122,7 +127,8 @@ async function refreshStatus() {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = (await res.json()) as HealthSnapshot;
-    if (conn) conn.textContent = body.configuration_security ?? 'Conectado';
+    if (conn) conn.textContent = body.configuration_security
+      ?? (body.local_print_intents?.needs_attention ? body.local_print_intents.detail : 'Conectado');
     if (count) count.textContent = String(body.printer_count);
     if (version) version.textContent = `v${body.version}`;
     if (versionValue) versionValue.textContent = `v${body.version}`;
@@ -132,7 +138,8 @@ async function refreshStatus() {
       // relay can be standing down or unable to write its ledger while this
       // request succeeds. Amber for that, so the dot stops being a lie.
       dot.classList.remove('is-error');
-      dot.classList.toggle('is-warn', body.relay?.needs_attention === true || !!body.configuration_security);
+      dot.classList.toggle('is-warn', body.relay?.needs_attention === true
+        || body.local_print_intents?.needs_attention === true || !!body.configuration_security);
     }
   } catch (e) {
     if (conn) conn.textContent = 'Sin conexión';
