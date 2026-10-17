@@ -1,0 +1,30 @@
+# Bridge v0.1.7 hardening
+
+Objective: implement the six approved v0.1.7 follow-ups from shipped v0.1.6 without issuing a certificate or publishing a release. Branch: `feat/bridge-v017-hardening`, based on `origin/main` `40bc5bc`; delivery: local Conventional Commit work units only until remote delivery is authorized; test runner: Cargo, deterministic browser e2e where applicable, and Windows `ci.yml`.
+Strategy: `ask-on-risk`; forecast approximately 900-1,500 authored lines across six units, so PR chain choice is pending and no PR is currently in scope.
+
+## Specs
+
+- **S1 — Scope and sequence.** Claude's handoff: "The order F6 → F4 → F1 → F2 → F3 → F5 is approved, as are the per-unit checks." One test-first commit per coherent unit, splitting only if a natural unit exceeds the ~400-line review budget.
+- **S2 — F6 certificate safety.** The embedded certificate expires 2026-12-30. Correct the monthly/45-day schedule's single pre-expiry attempt, add a deterministic expiry-margin gate and a reviewed operator procedure. "F6 renewal itself waits for the owner's approval." No DNS issuance or production operation.
+- **S3 — F4 release overrides.** "release builds ignore GOURMELYPRINT_DATA_DIR, CERT_DIR and SINK_DIR. There is no privileged support switch. Before writing it, grep the installer, service definitions and ops docs to confirm no shipped release configuration sets any of the three. If one does, stop and report." Keep debug/test isolation and the default disk certificate path.
+- **S4 — F1 pairing.** In known degraded storage mode, refuse before redeeming the one-use pairing code; prove zero outbound redemption, unchanged unpaired settings and a successful retry after repair. Do not claim to solve an arbitrary write failure after a successful preflight.
+- **S5 — F2 runtime ledger recovery.** "after storage repair, recover automatically in the same process, but ONLY after a durable write+fsync probe succeeds. Until then, fail closed (no `printIntentId` capability, repairable status). No operator restart required." Preserve legacy no-intent printing where safe.
+- **S6 — F3 lossless compaction.** "lossless compaction only. No intent-ID eviction in v0.1.7; eviction waits until an API replay horizon is agreed." Preserve fingerprints, outcomes and interrupted claims across crash/reopen.
+- **S7 — F5 ACL repair.** "an explicit administrator-run repair command (CLI, elevated) that takes the target cashier account as an argument, verifies it, and reassigns only to that SID plus SYSTEM/Administrators. Never automatic on startup." Unauthorized mismatch must leave bytes/ACLs untouched; Windows CI must exercise the authorized repair.
+- **S8 — Safety and proof.** "Same rules as before: a fresh worktree from origin/main; no DNS, no production host, no tag, release or publish." Use RED→GREEN per rule, `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`, applicable deterministic e2e/Windows CI, and independent risk verification plus RDD. Notify Claude by Herdr before file writes and after each unit; append substantive reports to `odd/handoff/bridge-codex.md`.
+
+## Tasks
+
+- [ ] **T1 F6** — S1/S2/S8; inline; certificate cadence, deterministic gate and runbook; one commit; Risk: item 5 (CI/renewal).
+- [ ] **T2 F4** — S1/S3/S8; inline; precheck shipped configs, release override boundary and proof; one commit; Risk: items 2 and 5.
+- [ ] **T3 F1** — S1/S4/S8; inline; pairing preflight and API mock proof; one commit; Risk: item 2.
+- [ ] **T4 F2** — S1/S5/S8; inline; runtime capability withdrawal, durable recovery and status; one commit; Risk: items 1, 3 and 4.
+- [ ] **T5 F3** — S1/S6/S8; inline; lossless atomic compaction and fault/restart proof; one commit; Risk: items 1 and 4.
+- [ ] **T6 F5** — S1/S7/S8; inline unless context backstop; elevated explicit ACL repair and Windows CI; one or more coherent commits if needed; Risk: items 1, 2 and 5.
+
+## Log
+
+- **L1 (2026-10-17, user verbatim):** "[Claude] DECISIONS: #925 fusionado. Sigue bridge 0.1.7 (6 mejoras + procedimiento de certificado), sin release; primero el plan → odd/handoff/claude.md"
+- **L2 (2026-10-17, user verbatim):** "[Claude] DECISION: plan 0.1.7 aprobado con las 4 decisiones (opción segura en cada una) → odd/handoff/claude.md"
+- **L3 (evidence):** `origin/main` is `40bc5bc` / v0.1.6. Local `main` is stale at v0.1.4 and the frozen v0.1.6 feature checkout contains pre-existing unrelated edits; this fresh worktree and branch were created from `origin/main` without changing them. The six-item plan is in GourmelyHub `odd/handoff/bridge-codex.md` at 2026-10-17 10:44. No push, tag, release, certificate issuance or production/customer access is authorized.

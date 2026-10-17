@@ -9,6 +9,7 @@
     "test:e2e": "tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --skipLibCheck tests/ui-security.e2e.ts e2e.config.ts && e2e run tests/ui-security.e2e.ts",
     "test:csp": "node --test tests/csp.test.mjs",
     "test:version": "node --test tests/version.test.mjs",
+    "test:certificate": "node --test tests/cert-renewal.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

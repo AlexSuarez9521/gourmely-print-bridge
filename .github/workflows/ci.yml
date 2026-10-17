@@ -80,6 +80,9 @@ jobs:
       - name: Check release metadata
         run: npm run test:version
 
+      - name: Check embedded TLS certificate runway
+        run: npm run test:certificate
+
       - name: Check UI security policy
         run: npm run test:csp
 

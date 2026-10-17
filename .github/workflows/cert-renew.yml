@@ -7,9 +7,9 @@ name: Cert Renewal
 # gets the new cert via the next installer update (or the Tauri
 # auto-updater).
 #
-# Let's Encrypt certs are valid 90 days. This runs MONTHLY and renews only
-# when fewer than RENEW_WINDOW_DAYS remain, so a single failed run is never
-# fatal: there are two more attempts inside the window.
+# Let's Encrypt certs are valid 90 days. Weekly checks in the final 45 days
+# allow repeated issuance attempts before the 30-day publication gate fails.
+# A successful PR is not a published release; the owner must review and ship it.
 #
 # WHY IT IS WRITTEN THIS WAY (2026-08-13). Until today this workflow had never
 # issued a real certificate. The scheduled run of 2026-07-01 failed with nobody
@@ -28,16 +28,10 @@ name: Cert Renewal
 
 on:
   schedule:
-    # MONTHLY, at 03:00 UTC — and the job exits early unless the shipped cert
-    # has less than RENEW_WINDOW_DAYS left, so this is not a monthly release.
-    #
-    # It used to run every 60 days. That gives ONE attempt per cycle, and on
-    # 2026-07-01 that attempt failed (the Cloudflare secret was missing) with
-    # nobody watching: the next one was due 2026-09-01, five days before the
-    # cert expired. A schedule where a single silent failure can take a
-    # restaurant's printing offline is not a schedule, it is a coin flip.
-    # Monthly gives two spare attempts inside the renewal window.
-    - cron: "0 3 1 * *"
+    # Every Monday at 03:00 UTC. The old monthly cadence gave the certificate
+    # expiring 2026-12-30 only one scheduled run inside its 45-day window.
+    # The workflow exits early when the shipped certificate is not due.
+    - cron: "0 3 * * 1"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -62,8 +56,8 @@ concurrency:
 env:
   DOMAIN: "localhost.gourmelyhub.busticco.com"
   CERT_EMAIL: "alexsuarez9521@gmail.com"
-  # Renew when the shipped cert has less than this left. Let's Encrypt issues
-  # for 90 days, so 45 leaves three monthly attempts inside the window.
+  # Renew when the shipped cert has this many days left. Weekly checks give
+  # multiple attempts before CI's 30-day publication runway gate.
   RENEW_WINDOW_DAYS: "45"
 
 jobs:
