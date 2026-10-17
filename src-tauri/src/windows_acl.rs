@@ -655,7 +655,7 @@ mod selection_tests {
 
     fn sddl(path: &Path) -> String {
         powershell(
-            "(Get-Acl -LiteralPath $env:BRIDGE_ACL_TEST_PATH).Sddl",
+            "if ([System.IO.Directory]::Exists($env:BRIDGE_ACL_TEST_PATH)) { $acl = [System.IO.Directory]::GetAccessControl($env:BRIDGE_ACL_TEST_PATH) } else { $acl = [System.IO.File]::GetAccessControl($env:BRIDGE_ACL_TEST_PATH) }; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)",
             path,
         )
     }
