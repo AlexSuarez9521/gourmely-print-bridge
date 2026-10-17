@@ -314,7 +314,7 @@ impl HealthLocalPrintIntents {
             Self {
                 ok: false,
                 needs_attention: true,
-                detail: "Impresión segura pausada: revise permisos y espacio del directorio de datos; ejecute la reparación como administrador o contacte soporte. No borre el historial de impresiones.",
+                detail: "Impresión segura pausada: revise el espacio del directorio de datos. Si fallaron los permisos, cierre Bridge y ejecute 'print-bridge repair-acl --account <usuario-de-caja>' como administrador con la sesión de caja activa; si persiste, contacte soporte. No borre el historial de impresiones.",
             }
         }
     }
@@ -1111,6 +1111,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("administrador"));
+        assert!(health["local_print_intents"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("repair-acl --account"));
         let unsupported = ws_exchange(
             &mut socket,
             serde_json::json!({

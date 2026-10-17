@@ -247,13 +247,13 @@ enum ConfigReadIssue {
 }
 
 #[cfg(windows)]
-const ACL_REPAIR_ACTION: &str = "La configuración necesita reparación: abre GourmelyPrint Bridge una vez como administrador con la sesión de caja activa y luego reinícialo normalmente.";
+const ACL_REPAIR_ACTION: &str = "La configuración necesita reparación: cierra Bridge y ejecuta 'print-bridge repair-acl --account <usuario-de-caja>' como administrador con la sesión de caja activa; luego reinicia Bridge normalmente.";
 
 #[cfg(windows)]
 const MALFORMED_CONFIG_ACTION: &str = "config.json está dañado: detén GourmelyPrint Bridge, haz un respaldo seguro del archivo y restaura una copia válida o renómbralo; luego reinicia y vuelve a emparejar la estación.";
 
 #[cfg(windows)]
-const OTHER_USER_ACTION: &str = "Los archivos protegidos pertenecen a otro usuario de Windows. No se cambiaron los permisos: cierra Bridge, inicia la sesión de caja correcta y ejecuta la reparación como administrador con esa sesión activa.";
+const OTHER_USER_ACTION: &str = "Los archivos protegidos pertenecen a otro usuario de Windows. No se cambiaron los permisos: cierra Bridge, inicia la sesión de caja correcta y ejecuta 'print-bridge repair-acl --account <usuario-de-caja>' como administrador con esa sesión activa.";
 
 /// Reads the settings file, tolerating every way it can be absent or broken.
 ///

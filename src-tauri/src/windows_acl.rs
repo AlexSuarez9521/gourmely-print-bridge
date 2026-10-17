@@ -343,6 +343,23 @@ fn repair_for_verified_sid(
             Err(error) => Some(Err(error)),
         })
         .collect::<io::Result<Vec<_>>>()?;
+    // Existing ledger locks are nonblocking process-liveness guards. Hold
+    // them until verification finishes so a running bridge cannot recreate
+    // files while their ACLs are being reassigned.
+    let mut _held_ledger_locks = Vec::new();
+    for name in ["local-print-intents.lock", "print-jobs.lock"] {
+        let path = dir.join(name);
+        if existing.contains(&path) {
+            _held_ledger_locks.push(
+                crate::acl_repair::hold_existing_ledger_lock(&path)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "print ledger lock changed during repair",
+                    )
+                })?,
+            );
+        }
+    }
     // Resolve every path, readable content and managed ACL before the first
     // DACL change. Otherwise a late unreadable ledger may strand startup.
     for path in std::iter::once(dir).chain(existing.iter().map(|path| path.as_path())) {
@@ -668,6 +685,7 @@ mod selection_tests {
             "config.json",
             "local-print-intents.jsonl",
             "local-print-intents.jsonl.tmp",
+            "local-print-intents.lock",
             "print-jobs.jsonl.tmp",
         ];
         for name in files {
@@ -698,6 +716,21 @@ mod selection_tests {
         for name in files {
             assert_eq!(fs::read(dir.join(name)).unwrap(), name.as_bytes());
         }
+
+        let active =
+            crate::instance_lock::InstanceLock::acquire(dir.join("local-print-intents.lock"))
+                .unwrap();
+        let locked: Vec<_> = paths.iter().map(|path| sddl(path)).collect();
+        assert!(repair_for_verified_sid(&dir, &sid, &sid, true).is_err());
+        for (path, expected) in paths.iter().zip(&locked) {
+            assert_eq!(
+                &sddl(path),
+                expected,
+                "live repair mutated {}",
+                path.display()
+            );
+        }
+        drop(active);
 
         let malformed = dir.join("print-jobs.jsonl");
         fs::create_dir(&malformed).unwrap();
