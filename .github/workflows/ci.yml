@@ -104,6 +104,10 @@ jobs:
         working-directory: src-tauri
         run: cargo test --all-targets
 
+      - name: Release builds ignore environment redirects
+        working-directory: src-tauri
+        run: cargo test --release --locked --test release_overrides
+
   ui-security:
     name: deterministic browser security tests
     runs-on: ubuntu-latest

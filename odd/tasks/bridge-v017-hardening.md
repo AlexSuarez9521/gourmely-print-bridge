@@ -16,7 +16,7 @@ Strategy: `ask-on-risk`; forecast approximately 900-1,500 authored lines across 
 
 ## Tasks
 
-- [ ] **T1 F6** — S1/S2/S8; inline; certificate cadence, deterministic gate and runbook; one commit; Risk: item 5 (CI/renewal).
+- [x] **T1 F6** — S1/S2/S8; inline; certificate cadence, deterministic gate and runbook; `37d0eeb`; RED→GREEN, Cargo/npm checks and independent verifier passed; RDD approved and acknowledged; Risk: item 5 (CI/renewal).
 - [ ] **T2 F4** — S1/S3/S8; inline; precheck shipped configs, release override boundary and proof; one commit; Risk: items 2 and 5.
 - [ ] **T3 F1** — S1/S4/S8; inline; pairing preflight and API mock proof; one commit; Risk: item 2.
 - [ ] **T4 F2** — S1/S5/S8; inline; runtime capability withdrawal, durable recovery and status; one commit; Risk: items 1, 3 and 4.
@@ -28,3 +28,4 @@ Strategy: `ask-on-risk`; forecast approximately 900-1,500 authored lines across 
 - **L1 (2026-10-17, user verbatim):** "[Claude] DECISIONS: #925 fusionado. Sigue bridge 0.1.7 (6 mejoras + procedimiento de certificado), sin release; primero el plan → odd/handoff/claude.md"
 - **L2 (2026-10-17, user verbatim):** "[Claude] DECISION: plan 0.1.7 aprobado con las 4 decisiones (opción segura en cada una) → odd/handoff/claude.md"
 - **L3 (evidence):** `origin/main` is `40bc5bc` / v0.1.6. Local `main` is stale at v0.1.4 and the frozen v0.1.6 feature checkout contains pre-existing unrelated edits; this fresh worktree and branch were created from `origin/main` without changing them. The six-item plan is in GourmelyHub `odd/handoff/bridge-codex.md` at 2026-10-17 10:44. No push, tag, release, certificate issuance or production/customer access is authorized.
+- **L4 (T1 F6):** RED: monthly cadence and absent CI gate failed 2 certificate tests (1 passed). GREEN: `npm run test:certificate` 3/3, version 2/2, CSP 1/1, `npm run build`, `cargo test --locked` 114 passed/5 ignored, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`. Independent verifier passed after one runbook correction: `release.yml` publishes automatically on tag, so owner approval must precede tagging. Baseline had one eligible scheduled attempt; weekly cadence has seven, including three before the 30-day gate. Commit `37d0eeb` reviewed with risk/resilience/readability/reliability lenses, no findings, acknowledgement burned. Windows CI was not dispatched; certificate issuance and release remain owner-only.

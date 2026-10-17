@@ -212,11 +212,14 @@ impl Settings {
 
 /// Directory that holds `config.json` (and the cert override).
 ///
-/// `GOURMELYPRINT_DATA_DIR` overrides it, which is what the integration tests
-/// and support use to work on a throwaway copy instead of the real install.
+/// Debug builds may redirect it with `GOURMELYPRINT_DATA_DIR` for isolated
+/// tests. Release builds always use the machine-wide location.
 pub fn data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("GOURMELYPRINT_DATA_DIR") {
-        return Some(PathBuf::from(dir));
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dir) = std::env::var_os("GOURMELYPRINT_DATA_DIR") {
+            return Some(PathBuf::from(dir));
+        }
     }
     std::env::var_os("PROGRAMDATA").map(|p| PathBuf::from(p).join("GourmelyPrint"))
 }

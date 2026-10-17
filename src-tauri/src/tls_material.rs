@@ -36,12 +36,14 @@ use std::sync::Arc;
 ///
 /// `%PROGRAMDATA%\GourmelyPrint\certs` — machine-wide (every Windows account on
 /// the till shares one bridge) and, unlike `%PROGRAMFILES%`, writable without
-/// fighting UAC on every renewal. Overridable with `GOURMELYPRINT_CERT_DIR`,
-/// which is what support uses to test a cert on one machine without touching
-/// the real path.
+/// fighting UAC on every renewal. Debug builds may redirect this with
+/// `GOURMELYPRINT_CERT_DIR` for isolated tests; release builds cannot.
 pub fn cert_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("GOURMELYPRINT_CERT_DIR") {
-        return Some(PathBuf::from(dir));
+    #[cfg(debug_assertions)]
+    {
+        if let Some(dir) = std::env::var_os("GOURMELYPRINT_CERT_DIR") {
+            return Some(PathBuf::from(dir));
+        }
     }
     std::env::var_os("PROGRAMDATA").map(|p| PathBuf::from(p).join("GourmelyPrint").join("certs"))
 }
