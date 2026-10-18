@@ -173,6 +173,10 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
         .unwrap_or_default()
         .contains("otro usuario de Windows"));
     assert!(wrong_user
+        .security_issue()
+        .unwrap_or_default()
+        .contains("repair-acl --account"));
+    assert!(wrong_user
         .update(|settings| settings.label = Some("Wrong user".into()))
         .is_err());
     assert_eq!(fs::read(&config).unwrap(), saved_config);
@@ -243,6 +247,10 @@ fn migrates_legacy_config_without_exposing_token_or_losing_access() {
         .security_issue()
         .unwrap_or_default()
         .contains("administrador"));
+    assert!(unsafe_path
+        .security_issue()
+        .unwrap_or_default()
+        .contains("repair-acl --account"));
     assert!(unsafe_path
         .update(|s| s.label = Some("Unsafe".into()))
         .is_err());

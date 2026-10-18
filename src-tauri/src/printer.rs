@@ -17,21 +17,28 @@ use printers::common::converters::Converter;
 
 /// Env var that redirects every print job to a file instead of the spooler.
 ///
-/// This is the QA and support hatch, and it earns its place: the relay has to
+/// This is a debug-build QA hatch: the relay has to
 /// be provable end to end — pair, connect, receive, print, ack — and a CI
 /// runner has no thermal printer, nor does the machine of whoever is debugging
 /// a customer's ticket at two in the morning. Writing the ESC/POS bytes to a
 /// file exercises the same path the spooler does, up to the spooler itself.
 ///
-/// Off unless the variable is set, and every job logs a warning saying where
+/// Compiled out of release builds. In debug builds, every redirected job logs where
 /// the paper went — an install that silently swallowed tickets into a folder
 /// would be indistinguishable from a printer that works.
 const SINK_ENV: &str = "GOURMELYPRINT_SINK_DIR";
 
 fn sink_dir() -> Option<PathBuf> {
-    std::env::var_os(SINK_ENV)
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(SINK_ENV)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
 }
 
 /// Returns the printable names of every printer registered on this

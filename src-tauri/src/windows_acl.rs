@@ -8,7 +8,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER},
+    Foundation::{CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER},
     Security::{
         AclSizeInformation,
         Authorization::{
@@ -16,14 +16,16 @@ use windows_sys::Win32::{
             GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
         },
         GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        IsValidSid, LookupAccountNameW, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        SID_NAME_USE,
+        GetTokenInformation, IsValidSid, LookupAccountNameW, SidTypeUser, TokenElevation,
+        ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SID_NAME_USE, TOKEN_ELEVATION,
+        TOKEN_QUERY,
     },
     System::RemoteDesktop::{
         WTSActive, WTSDomainName, WTSEnumerateSessionsW, WTSFreeMemory,
         WTSQuerySessionInformationW, WTSUserName, WTS_CURRENT_SERVER_HANDLE,
     },
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
 fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
@@ -126,8 +128,50 @@ fn account_sid(account: &str) -> io::Result<String> {
     {
         return Err(io::Error::last_os_error());
     }
+    if use_kind != SidTypeUser {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ACL repair target must be a Windows user account",
+        ));
+    }
     // SAFETY: LookupAccountNameW filled a valid binary SID.
     sid_text(sid.as_mut_ptr().cast())
+}
+
+fn is_elevated() -> io::Result<bool> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess is a process pseudo-handle; close only the
+    // real token handle returned by OpenProcessToken.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0;
+        // SAFETY: the output pointer names a TOKEN_ELEVATION of the given size.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if returned as usize != std::mem::size_of::<TOKEN_ELEVATION>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Windows token elevation response",
+            ));
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    })();
+    // SAFETY: OpenProcessToken returned this owned handle.
+    unsafe { CloseHandle(token) };
+    result
 }
 
 fn unique_active_sid(mut identities: Vec<String>) -> io::Result<String> {
@@ -246,15 +290,106 @@ fn set_private_dacl(path: &Path, user_sid: &str, directory: bool) -> io::Result<
     result
 }
 
-const SENSITIVE_FILES: [&str; 7] = [
+const SENSITIVE_FILES: [&str; 8] = [
     "config.json",
     "config.json.tmp",
     "local-print-intents.jsonl",
+    "local-print-intents.jsonl.tmp",
     "local-print-intents.lock",
     "print-jobs.jsonl",
     "print-jobs.jsonl.tmp",
     "print-jobs.lock",
 ];
+
+/// This path deliberately does not run from SettingsStore::load. Authorization
+/// must finish before even inspecting mutable paths, and no target account is
+/// inferred from the elevated process identity.
+pub fn repair_data_dir_for_account(dir: &Path, account: &str) -> io::Result<()> {
+    if account.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ACL repair requires --account <cashier-user>",
+        ));
+    }
+    let elevated = is_elevated()?;
+    if !elevated {
+        return crate::acl_repair::authorize_repair("", "", false);
+    }
+    let target_sid = account_sid(account)?;
+    let active_sid = interactive_user_sid()?;
+    repair_for_verified_sid(dir, &target_sid, &active_sid, elevated)
+}
+
+fn repair_for_verified_sid(
+    dir: &Path,
+    target_sid: &str,
+    active_sid: &str,
+    elevated: bool,
+) -> io::Result<()> {
+    crate::acl_repair::authorize_repair(target_sid, active_sid, elevated)?;
+    if !exists_or_error(dir)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "bridge data directory does not exist; no ACL was changed",
+        ));
+    }
+    std::fs::read_dir(dir)?;
+    let existing = SENSITIVE_FILES
+        .iter()
+        .map(|name| dir.join(name))
+        .filter_map(|path| match exists_or_error(&path) {
+            Ok(true) => Some(Ok(path)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    // Existing ledger locks are nonblocking process-liveness guards. Hold
+    // them until verification finishes so a running bridge cannot recreate
+    // files while their ACLs are being reassigned.
+    let mut _held_ledger_locks = Vec::new();
+    for name in ["local-print-intents.lock", "print-jobs.lock"] {
+        let path = dir.join(name);
+        if existing.contains(&path) {
+            _held_ledger_locks.push(
+                crate::acl_repair::hold_existing_ledger_lock(&path)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "print ledger lock changed during repair",
+                    )
+                })?,
+            );
+        }
+    }
+    // Resolve every path, readable content and managed ACL before the first
+    // DACL change. Otherwise a late unreadable ledger may strand startup.
+    for path in std::iter::once(dir).chain(existing.iter().map(|path| path.as_path())) {
+        if path != dir {
+            if !std::fs::metadata(path)?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sensitive bridge path is not a regular file; no ACL was changed",
+                ));
+            }
+            std::fs::File::open(path)?;
+        }
+        managed_user_sid(path)?;
+    }
+    // Files first: a failure protecting the parent leaves each repaired file
+    // accessible to the target. A partial ACL update is retried explicitly.
+    for path in &existing {
+        set_private_dacl(path, target_sid, false)?;
+    }
+    set_private_dacl(dir, target_sid, true)?;
+    for path in std::iter::once(dir).chain(existing.iter().map(|path| path.as_path())) {
+        if managed_user_sid(path)?.as_deref() != Some(target_sid) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ACL repair verification failed; run the command again as administrator",
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn ambiguous_acl() -> io::Error {
     io::Error::new(
@@ -450,9 +585,80 @@ pub fn protect_file_for_user(path: &Path, user_sid: &str) -> io::Result<()> {
     set_private_dacl(path, user_sid, false)
 }
 
+/// A compaction temp must have the existing ledger's DACL before any record is
+/// written. This copies rights; it does not choose or repair a cashier SID.
+pub fn preserve_ledger_acl_for_temp(source: &Path, temp: &Path) -> io::Result<()> {
+    let source_wide = wide(source.as_os_str());
+    let temp_wide = wide(temp.as_os_str());
+    let mut descriptor = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    // SAFETY: Windows owns descriptor/dacl until LocalFree below.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            source_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(win_error(code));
+    }
+    let result = if dacl.is_null() || descriptor.is_null() {
+        Err(ambiguous_acl())
+    } else {
+        // SAFETY: dacl points into the live source descriptor for this call.
+        let code = unsafe {
+            SetNamedSecurityInfoW(
+                temp_wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(win_error(code))
+        }
+    };
+    // SAFETY: descriptor was allocated by GetNamedSecurityInfoW.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
 #[cfg(test)]
 mod selection_tests {
-    use super::unique_active_sid;
+    use super::{managed_user_sid, repair_for_verified_sid, unique_active_sid};
+    use std::{fs, path::Path, process::Command};
+
+    fn powershell(script: &str, path: &Path) -> String {
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("BRIDGE_ACL_TEST_PATH", path)
+            .output()
+            .expect("run Windows ACL inspection");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn sddl(path: &Path) -> String {
+        powershell(
+            "if ([System.IO.Directory]::Exists($env:BRIDGE_ACL_TEST_PATH)) { $acl = [System.IO.Directory]::GetAccessControl($env:BRIDGE_ACL_TEST_PATH) } else { $acl = [System.IO.File]::GetAccessControl($env:BRIDGE_ACL_TEST_PATH) }; $acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)",
+            path,
+        )
+    }
 
     #[test]
     fn only_one_active_cashier_is_selected_even_if_the_process_is_elevated() {
@@ -465,5 +671,79 @@ mod selection_tests {
         );
         assert!(unique_active_sid(vec![]).is_err());
         assert!(unique_active_sid(vec![cashier, elevated_process]).is_err());
+    }
+
+    #[test]
+    fn explicit_repair_preflights_all_sensitive_files_and_preserves_bytes() {
+        let dir = std::env::temp_dir().join(format!("bridge-acl-repair-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let sid = powershell(
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            &dir,
+        );
+        let files = [
+            "config.json",
+            "local-print-intents.jsonl",
+            "local-print-intents.jsonl.tmp",
+            "local-print-intents.lock",
+            "print-jobs.jsonl.tmp",
+        ];
+        for name in files {
+            fs::write(dir.join(name), name.as_bytes()).unwrap();
+        }
+        let paths: Vec<_> = std::iter::once(dir.clone())
+            .chain(files.iter().map(|name| dir.join(name)))
+            .collect();
+        let before: Vec<_> = paths.iter().map(|path| sddl(path)).collect();
+        let other = "S-1-5-21-100-200-300-401";
+        assert!(repair_for_verified_sid(&dir, &sid, &sid, false).is_err());
+        assert!(repair_for_verified_sid(&dir, &sid, other, true).is_err());
+        for (path, expected) in paths.iter().zip(&before) {
+            assert_eq!(
+                &sddl(path),
+                expected,
+                "unauthorized ACL mutation: {}",
+                path.display()
+            );
+        }
+        repair_for_verified_sid(&dir, &sid, &sid, true).unwrap();
+        for path in &paths {
+            assert_eq!(
+                managed_user_sid(path).unwrap().as_deref(),
+                Some(sid.as_str())
+            );
+        }
+        for name in files {
+            assert_eq!(fs::read(dir.join(name)).unwrap(), name.as_bytes());
+        }
+
+        let active =
+            crate::instance_lock::InstanceLock::acquire(dir.join("local-print-intents.lock"))
+                .unwrap();
+        let locked: Vec<_> = paths.iter().map(|path| sddl(path)).collect();
+        assert!(repair_for_verified_sid(&dir, &sid, &sid, true).is_err());
+        for (path, expected) in paths.iter().zip(&locked) {
+            assert_eq!(
+                &sddl(path),
+                expected,
+                "live repair mutated {}",
+                path.display()
+            );
+        }
+        drop(active);
+
+        let malformed = dir.join("print-jobs.jsonl");
+        fs::create_dir(&malformed).unwrap();
+        let after: Vec<_> = paths.iter().map(|path| sddl(path)).collect();
+        assert!(repair_for_verified_sid(&dir, &sid, &sid, true).is_err());
+        for (path, expected) in paths.iter().zip(&after) {
+            assert_eq!(
+                &sddl(path),
+                expected,
+                "late preflight mutated {}",
+                path.display()
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

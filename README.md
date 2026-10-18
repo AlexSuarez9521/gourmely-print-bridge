@@ -198,15 +198,32 @@ be reassigned to another active Windows user. If ACL repair fails, readable
 config remains available but settings writes stop; `/health.configuration_security`
 and the status panel explain the repair.
 
-For installation or repair, stop the bridge, install binaries as Administrator
-**without launching the bridge**, then start it only from the cashier's
-interactive session. Never launch it from an SSH or administrator session.
-For a legacy ACL that still needs elevation, keep the cashier's session active,
-run the bridge once elevated from that session, close the elevated instance,
-and start it normally as the cashier. If the status says files belong to
-another Windows user, do not reassign the ACL manually; close other sessions
-and use the correct cashier session. Confirm `/health.configuration_security`
-is `null` before pairing or changing settings; do not edit tokens by hand.
+For installation, stop the bridge, install binaries as Administrator **without
+launching the bridge**, then start it only from the cashier's interactive
+session. Never launch it from an SSH or administrator session. Repair is never
+automatic on startup. If `/health.configuration_security` or the status panel
+requests ACL repair, fully stop Bridge (including its tray process), leave only
+the intended cashier's console/RDP session active, and run this in PowerShell
+from that cashier session (UAC will request administrator credentials):
+
+```powershell
+$exe = Join-Path $env:ProgramFiles 'GourmelyPrint Bridge\print-bridge.exe'
+$cashier = "$env:USERDOMAIN\$env:USERNAME"
+$repair = Start-Process -FilePath $exe -ArgumentList "repair-acl --account `"$cashier`"" -Verb RunAs -Wait -PassThru
+if ($repair.ExitCode -ne 0) { throw "ACL repair failed (exit $($repair.ExitCode)); keep Bridge stopped and contact support." }
+```
+
+The GUI-subsystem release executable does not provide a console transcript;
+PowerShell's exit code is the result. Zero means every existing sensitive file
+(including the local print ledger and its `.tmp`) and the data directory were
+verified with a protected ACL for that cashier, SYSTEM and Administrators.
+The owner-rights ACE prevents a previous owner from changing permissions.
+Nonzero leaves Bridge stopped: check the active session, account, elevation,
+directory permissions and free disk space before retrying. If a partial ACL
+update occurred, the same explicit command can be rerun; never delete the
+ledger or edit tokens manually. Start Bridge normally as the cashier, then
+confirm `/health.configuration_security` is `null` before pairing or changing
+settings.
 
 If the status instead reports damaged `config.json`, elevation alone cannot
 repair invalid JSON. Stop the bridge and make a restricted-access backup of

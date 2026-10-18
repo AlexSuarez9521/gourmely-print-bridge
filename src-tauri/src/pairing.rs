@@ -138,6 +138,12 @@ pub async fn pair(
         ));
     }
 
+    // A known-unwritable store cannot keep the one-time token returned by the
+    // server. Refuse before the POST rather than burning the operator's code.
+    if let Some(issue) = settings.security_issue() {
+        return Err(BridgeError::Config(issue.to_string()));
+    }
+
     let base = validated_server_url(server_url).map_err(BridgeError::Pairing)?;
     let url = format!("{base}/v1/print-relay/pair");
 
@@ -233,6 +239,8 @@ pub fn forget(settings: &SettingsStore) -> BridgeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -277,6 +285,67 @@ mod tests {
             .to_string()
             .contains("HTTPS"));
         assert!(!settings.snapshot().is_paired());
+    }
+
+    #[tokio::test]
+    async fn degraded_storage_does_not_redeem_a_one_use_code_and_can_retry_after_repair() {
+        use axum::{routing::post, Json, Router};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route(
+            "/v1/print-relay/pair",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "success": true,
+                        "data": {
+                            "stationToken": "test-token",
+                            "stationId": "station-test",
+                            "tenantId": "tenant-test",
+                            "branchId": "branch-test",
+                            "label": "Test till",
+                            "roles": []
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock server");
+        let url = format!("http://{}", listener.local_addr().expect("mock address"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock pair server");
+        });
+
+        let settings = SettingsStore::in_memory(Default::default())
+            .with_security_issue("repair storage before pairing");
+        let before = serde_json::to_value(settings.snapshot()).expect("snapshot");
+        let error = pair(&settings, &url, "FJTX-35AH", vec![])
+            .await
+            .expect_err("degraded storage must refuse pairing");
+        assert!(error.to_string().contains("repair storage before pairing"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "code must not be redeemed");
+        assert_eq!(
+            serde_json::to_value(settings.snapshot()).expect("snapshot"),
+            before,
+            "degraded attempt must not mutate settings"
+        );
+
+        let repaired = SettingsStore::in_memory(settings.snapshot());
+        let result = pair(&repaired, &url, "FJTX-35AH", vec![])
+            .await
+            .expect("retry after storage repair");
+        assert_eq!(result.station_id, "station-test");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            repaired.snapshot().station_token.as_deref(),
+            Some("test-token")
+        );
+        server.abort();
     }
 
     #[tokio::test]

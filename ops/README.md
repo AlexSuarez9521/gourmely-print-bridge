@@ -27,9 +27,11 @@ only resolves to their loopback.
 
 ## Renewing without a rebuild (v0.1.3+)
 
-Since v0.1.3 the bridge reads its certificate from disk when one is there, and
-only falls back to the pair compiled into the binary. **A renewal no longer
-needs a release.** On each till:
+Since v0.1.3 the bridge reads a certificate from disk when one is there, and
+only falls back to the pair compiled into the binary. An owner-approved disk
+replacement can rescue an **existing** installation without a new release.
+A fresh installation still needs a released binary with a valid embedded pair.
+On an authorized till:
 
 ```powershell
 # As administrator, on the machine running the bridge
@@ -47,15 +49,19 @@ A bad file can't take printing offline: the PEM is parsed before it is trusted,
 and anything wrong (truncated, cert and key swapped, half a pair) logs and keeps
 the embedded certificate. See `src-tauri/src/tls_material.rs`.
 
-> **Keep doing the rebuild anyway, on a slower cadence.** The embedded pair is
-> what a brand-new install starts with, on a machine that has no file on disk
-> yet. If the binary is never rebuilt, a fresh install eventually ships with an
-> expired fallback — harmless while the disk copy is present, fatal on a new
-> till. Rebaking it once or twice a year is enough.
+> **A disk replacement is not the normal publication path.** The embedded
+> pair is what a fresh install uses. Merge the renewal PR and publish a new
+> bridge version before the embedded pair reaches the 30-day CI runway gate.
+> Never assume an existing till's disk PEM makes a new installer safe.
 
 ## Automated renewal (preferred)
 
-GitHub Actions runs `.github/workflows/cert-renew.yml` every 60 days.
+GitHub Actions checks `.github/workflows/cert-renew.yml` every Monday at
+03:00 UTC and issues only when the embedded certificate has at most 45 days
+left. The workflow creates a PR; it does **not** publish a new bridge. For the
+certificate expiring 2026-12-30 08:41 UTC, the first scheduled check inside
+that window is 2026-11-16. The 30-day CI gate requires a replacement before
+approximately 2026-11-30; allow time for review and the owner's release.
 The workflow:
 
 1. Installs certbot + `python3-certbot-dns-cloudflare` on the runner.
@@ -64,10 +70,11 @@ The workflow:
 4. Bumps the patch version in `tauri.conf.json` + `Cargo.toml`.
 5. Opens a PR against `main`.
 
-After merging the PR, tag `v<new-version>` and push it to trigger
-`release.yml`, which builds the new MSI, signs it for the auto-updater,
-and publishes it to a GitHub Release (the dashboard + updater use the
-permanent `/releases/latest/download/` URL).
+After review, obtain explicit owner approval before merging the PR and creating
+the `v<new-version>` tag. The tag triggers `release.yml`, which publishes the
+release automatically; there is no separate promotion gate. The owner verifies
+the published signed MSI and updater artifacts afterward. This procedure only
+documents those operations; work on bridge v0.1.7 does not authorize them.
 
 ### Required repo secrets
 
@@ -84,6 +91,27 @@ Trigger the workflow with `dry_run = "true"` from the Actions UI to
 exercise the DNS challenge without consuming a real Let's Encrypt
 issuance. Useful for verifying Cloudflare token scope or DNS
 propagation after changes.
+
+### Review and publication checklist
+
+1. Before requesting issuance, record the embedded certificate's SAN and
+   expiry: `openssl x509 -in src-tauri/certs/fullchain.pem -noout -enddate -ext subjectAltName`.
+   Run `npm run test:certificate`; it checks the hostname, matching private
+   key, and at least 30 days of remaining validity without printing key bytes.
+2. Only with the owner's approval, dispatch the renewal workflow or use the
+   manual fallback. A dry run exercises DNS but does not prove the real
+   certificate-copy and PR path.
+3. Review the new PEM pair, patch version in all manifests/lockfiles, and
+   `cargo test --locked` / `cargo clippy --locked --all-targets -- -D warnings`
+   / `cargo fmt --all -- --check`. Because a `GITHUB_TOKEN`-authored PR does not
+   automatically trigger CI, dispatch `ci.yml` on the PR branch and require
+   its Windows TLS and release-metadata checks to pass.
+4. The owner decides whether and when to merge, tag, publish, and install.
+   Record the published version and date; do not count certificate issuance
+   or PR creation as completed protection for a fresh installation.
+5. If the renewal path fails, escalate before the 30-day gate. Disk PEM
+   replacement is an owner-approved fallback for existing installations only;
+   it does not repair an expired embedded certificate in a fresh installer.
 
 ## Manual renewal (fallback)
 

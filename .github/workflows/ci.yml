@@ -80,6 +80,9 @@ jobs:
       - name: Check release metadata
         run: npm run test:version
 
+      - name: Check embedded TLS certificate runway
+        run: npm run test:certificate
+
       - name: Check UI security policy
         run: npm run test:csp
 
@@ -100,6 +103,16 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test --all-targets
+
+      - name: Prove ACL repair preflight and CLI on Windows
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --lib windows_acl::selection_tests::explicit_repair_preflights_all_sensitive_files_and_preserves_bytes
+          cargo test --locked --test acl_repair_cli
+
+      - name: Release builds ignore environment redirects
+        working-directory: src-tauri
+        run: cargo test --release --locked --test release_overrides
 
   ui-security:
     name: deterministic browser security tests
