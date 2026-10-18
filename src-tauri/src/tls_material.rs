@@ -177,9 +177,60 @@ mod tests {
     const EMBEDDED_CERT: &[u8] = include_bytes!("../certs/fullchain.pem");
     const EMBEDDED_KEY: &[u8] = include_bytes!("../certs/privkey.pem");
     const UNRELATED_KEY: &[u8] = include_bytes!("../tests/fixtures/unrelated-key.pem");
-    const VALID_AT: rustls::pki_types::UnixTime = rustls::pki_types::UnixTime::since_unix_epoch(
-        std::time::Duration::from_secs(1_792_108_800),
-    );
+
+    /// The shipped certificate's validity window, read from the certificate
+    /// itself. Fixed dates broke every renewal: a pair issued after the pinned
+    /// "now" was "not valid yet", and a pinned "after expiry" could fall inside
+    /// the new window. The first two UTCTime values (tag 0x17, 13 bytes) in a
+    /// leaf certificate's DER are notBefore and notAfter: names never use
+    /// UTCTime, and Let's Encrypt dates stay in UTCTime until 2050.
+    fn embedded_validity() -> (u64, u64) {
+        let der = rustls_pemfile::certs(&mut std::io::BufReader::new(EMBEDDED_CERT))
+            .next()
+            .expect("the embedded chain has a leaf")
+            .expect("the leaf is valid PEM");
+        let bytes = der.as_ref();
+        let mut times = bytes
+            .windows(15)
+            .filter(|w| w[0] == 0x17 && w[1] == 0x0d && w[14] == b'Z')
+            .map(|w| utc_time_to_unix(&w[2..14]));
+        let not_before = times.next().expect("notBefore");
+        let not_after = times.next().expect("notAfter");
+        (not_before, not_after)
+    }
+
+    /// "YYMMDDHHMMSS" (UTCTime, years 1950–2049) to seconds since the epoch.
+    fn utc_time_to_unix(digits: &[u8]) -> u64 {
+        let n = |i: usize| u64::from((digits[i] - b'0') * 10 + (digits[i + 1] - b'0'));
+        let yy = n(0);
+        let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
+        let (month, day) = (n(2), n(4));
+        // Days from civil (Howard Hinnant), valid for the Gregorian calendar.
+        let y = if month <= 2 { year - 1 } else { year } as i64;
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let m = month as i64;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        days as u64 * 86_400 + n(6) * 3_600 + n(8) * 60 + n(10)
+    }
+
+    /// A moment one day inside the shipped certificate's validity.
+    fn valid_at() -> rustls::pki_types::UnixTime {
+        rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            embedded_validity().0 + 86_400,
+        ))
+    }
+
+    #[test]
+    fn the_validity_window_is_read_from_the_certificate() {
+        let (not_before, not_after) = embedded_validity();
+        // Let's Encrypt issues 90-day certificates.
+        assert_eq!(not_after - not_before, 90 * 86_400 - 1);
+        // Spot-check the date arithmetic against a known value: 2026-10-01T08:41:47Z.
+        assert_eq!(utc_time_to_unix(b"261001084147"), 1_790_844_107);
+    }
 
     /// Isolates `GOURMELYPRINT_CERT_DIR` per test. Tests in one binary share
     /// the process environment, so they must not run in parallel over it —
@@ -207,7 +258,7 @@ mod tests {
     #[test]
     fn the_shipped_certificate_validates_at_its_issue_date() {
         assert!(
-            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, VALID_AT).is_ok()
+            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, valid_at()).is_ok()
         );
     }
 
@@ -222,7 +273,7 @@ mod tests {
     #[test]
     fn falls_back_to_embedded_when_nothing_on_disk() {
         let material =
-            with_cert_dir(None, || resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)).unwrap();
+            with_cert_dir(None, || resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, valid_at())).unwrap();
         assert_eq!(material.source, "embedded");
         assert_eq!(material.cert, EMBEDDED_CERT);
     }
@@ -233,8 +284,10 @@ mod tests {
         std::fs::write(dir.join("fullchain.pem"), EMBEDDED_CERT).unwrap();
         std::fs::write(dir.join("privkey.pem"), EMBEDDED_KEY).unwrap();
 
-        let material =
-            with_cert_dir(Some(&dir), || resolve_at(b"ignored", b"ignored", VALID_AT)).unwrap();
+        let material = with_cert_dir(Some(&dir), || {
+            resolve_at(b"ignored", b"ignored", valid_at())
+        })
+        .unwrap();
 
         assert_eq!(material.source, "disk");
         assert_eq!(material.cert, EMBEDDED_CERT);
@@ -247,7 +300,7 @@ mod tests {
         std::fs::write(dir.join("privkey.pem"), EMBEDDED_KEY).unwrap();
 
         let material = with_cert_dir(Some(&dir), || {
-            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, valid_at())
         })
         .unwrap();
 
@@ -261,7 +314,7 @@ mod tests {
         std::fs::write(dir.join("fullchain.pem"), EMBEDDED_CERT).unwrap();
 
         let material = with_cert_dir(Some(&dir), || {
-            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, valid_at())
         })
         .unwrap();
 
@@ -280,7 +333,7 @@ mod tests {
         );
 
         let material = with_cert_dir(Some(&dir), || {
-            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, VALID_AT)
+            resolve_at(EMBEDDED_CERT, EMBEDDED_KEY, valid_at())
         })
         .unwrap();
 
@@ -292,10 +345,10 @@ mod tests {
     #[test]
     fn rejects_expired_pair_even_when_key_matches() {
         let after_expiry = rustls::pki_types::UnixTime::since_unix_epoch(
-            std::time::Duration::from_secs(1_798_761_600),
+            std::time::Duration::from_secs(embedded_validity().1 + 86_400),
         );
         assert!(
-            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, VALID_AT).is_ok()
+            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, config::BRIDGE_HOST, valid_at()).is_ok()
         );
         assert!(validate_pair_at(
             EMBEDDED_CERT,
@@ -308,12 +361,14 @@ mod tests {
 
     #[test]
     fn rejects_certificate_for_another_hostname() {
-        assert!(validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, "wrong.invalid", VALID_AT).is_err());
+        assert!(
+            validate_pair_at(EMBEDDED_CERT, EMBEDDED_KEY, "wrong.invalid", valid_at()).is_err()
+        );
     }
 
     #[test]
     fn invalid_embedded_pair_requires_action_instead_of_serving_it() {
-        let error = with_cert_dir(None, || resolve_at(b"invalid", b"invalid", VALID_AT))
+        let error = with_cert_dir(None, || resolve_at(b"invalid", b"invalid", valid_at()))
             .err()
             .expect("must refuse invalid embedded pair");
         assert!(error.contains("install a valid PEM pair"), "{error}");
