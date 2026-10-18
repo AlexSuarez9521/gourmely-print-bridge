@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bump (or check) the bridge version across the three files that carry it.
+"""Bump (or check) the bridge version across every file that carries it.
 
 Why a script instead of inline shell in the workflow: the renewal workflow used
 to do this with inline python plus an awk pass, and it only touched two of the
@@ -9,7 +9,9 @@ to break in ways nothing catches until the workflow runs months later (a
 terminator at the wrong indentation silently ends the YAML block).
 
 Here it is one place, runnable locally, with a --check mode the CI uses so the
-three files can never drift apart again.
+files can never drift apart again. Since v0.1.7 that includes package.json and
+both versions in package-lock.json: tests/version.test.mjs requires all six to
+match, and a renewal that bumped only the Rust side failed CI (PR #10).
 
     python3 ops/bump-version.py --check     # all three agree? (exit 1 if not)
     python3 ops/bump-version.py --patch     # x.y.z -> x.y.(z+1), prints the new
@@ -28,6 +30,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CONF = ROOT / "src-tauri" / "tauri.conf.json"
 CARGO = ROOT / "src-tauri" / "Cargo.toml"
 LOCK = ROOT / "src-tauri" / "Cargo.lock"
+NPM = ROOT / "package.json"
+NPM_LOCK = ROOT / "package-lock.json"
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -104,18 +108,51 @@ def write_lock(new: str) -> None:
     LOCK.write_text(text[:lo] + new + text[hi:], encoding="utf-8", newline="\n")
 
 
+# npm files: replace only the bridge's own version values. package-lock.json
+# also has a "version" for every dependency, so each value is located through
+# the exact text in front of it rather than by key name.
+# The first "version" key at two-space indent is the top-level one: every
+# nested object (dependencies, lockfile packages) is indented deeper.
+NPM_MARKER = '\n  "version": "'
+NPM_LOCK_TOP_MARKER = '\n  "version": "'
+NPM_LOCK_ROOT_MARKER = '"": {\n      "name": "print-bridge",\n      "version": "'
+
+
+def _marker_span(text: str, marker: str, where: str) -> tuple[int, int]:
+    idx = text.find(marker)
+    if idx == -1:
+        raise SystemExit(f"no bridge version found in {where}")
+    lo = idx + len(marker)
+    return lo, text.index('"', lo)
+
+
+def _read_marked(path: Path, marker: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    lo, hi = _marker_span(text, marker, path.name)
+    return text[lo:hi]
+
+
+def _write_marked(path: Path, marker: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    lo, hi = _marker_span(text, marker, path.name)
+    path.write_text(text[:lo] + new + text[hi:], encoding="utf-8", newline="\n")
+
+
 def current() -> dict[str, str]:
     return {
         "tauri.conf.json": read_conf(),
         "Cargo.toml": read_cargo(),
         "Cargo.lock": read_lock(),
+        "package.json": _read_marked(NPM, NPM_MARKER),
+        "package-lock.json": _read_marked(NPM_LOCK, NPM_LOCK_TOP_MARKER),
+        "package-lock.json (root package)": _read_marked(NPM_LOCK, NPM_LOCK_ROOT_MARKER),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--check", action="store_true", help="verify the three agree")
+    group.add_argument("--check", action="store_true", help="verify every file agrees")
     group.add_argument("--patch", action="store_true", help="bump the patch component")
     group.add_argument("--set", metavar="X.Y.Z", help="set an explicit version")
     args = parser.parse_args()
@@ -133,7 +170,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        print("\nall three agree")
+        print("\nall files agree")
         return 0
 
     old = versions["tauri.conf.json"]
@@ -151,10 +188,13 @@ def main() -> int:
     write_conf(new)
     write_cargo(new)
     write_lock(new)
+    _write_marked(NPM, NPM_MARKER, new)
+    _write_marked(NPM_LOCK, NPM_LOCK_TOP_MARKER, new)
+    _write_marked(NPM_LOCK, NPM_LOCK_ROOT_MARKER, new)
 
     # stdout is the contract with the workflow, which captures it.
     print(new)
-    print(f"bumped {old} -> {new} in all three files", file=sys.stderr)
+    print(f"bumped {old} -> {new} in every version file", file=sys.stderr)
     return 0
 
 
